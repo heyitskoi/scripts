@@ -1,0 +1,615 @@
+#!/usr/bin/env bash
+# ============================================================================
+# SUPERSETUP v2 — first Ops box bootstrap (Ubuntu/Debian)
+# Fast track: Docker, observability (Prom/Grafana/Loki/Alertmanager), Portainer,
+# local registry, SSH CA, Uptime-Kuma, and an Ansible project to manage it.
+# Sarcastic comments, minimal ceremony, actually idempotent.
+# ============================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+say(){ printf "\033[1;32m[+]\033[0m %s\n" "$*"; }
+nope(){ printf "\033[1;31m[!]\033[0m %s\n" "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------
+# Sanity checks
+# ------------------------------------------------------------
+[ "$(id -u)" -eq 0 ] && SUDO="" || SUDO="sudo"
+. /etc/os-release || nope "Unknown OS."
+[[ "${ID}" =~ (ubuntu|debian) ]] || nope "Use Ubuntu/Debian for this bootstrap."
+
+# ------------------------------------------------------------
+# Base packages
+# ------------------------------------------------------------
+say "Updating packages…"
+$SUDO apt-get update -y
+$SUDO apt-get install -y \
+  ca-certificates gnupg lsb-release curl git unzip tar make jq \
+  ufw fail2ban python3 python3-pip nmap
+
+# ------------------------------------------------------------
+# Docker CE (official repo)
+# ------------------------------------------------------------
+install_docker(){
+  if command -v docker >/dev/null 2>&1; then
+    say "Docker already present. Enabling service."
+    $SUDO systemctl enable --now docker || true
+    return 0
+  fi
+  say "Installing Docker CE…"
+  # Remove conflicting packages quietly
+  $SUDO apt-get -y remove docker.io containerd runc || true
+  $SUDO apt-get -y purge  docker.io containerd runc || true
+
+  $SUDO install -m 0755 -d /etc/apt/keyrings
+  [ -f /etc/apt/keyrings/docker.gpg ] || \
+    curl -fsSL https://download.docker.com/linux/${ID}/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+  if [ ! -f /etc/apt/sources.list.d/docker.list ]; then
+    arch=$(dpkg --print-architecture)
+    codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+    echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${codename} stable" | \
+      $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+  fi
+  $SUDO apt-get update -y
+  $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  $SUDO systemctl enable --now docker
+}
+install_docker
+
+ME="${SUDO_USER:-$USER}"
+$SUDO usermod -aG docker "$ME" || true
+
+# ------------------------------------------------------------
+# Helpers to install single-file archives
+# ------------------------------------------------------------
+install_zip_bin(){ # name ver url
+  local name="$1" ver="$2" url="$3"
+  command -v "$name" >/dev/null 2>&1 && return 0
+  say "Installing $name $ver…"
+  curl -fsSL -o "/tmp/${name}.zip" "$url"
+  $SUDO unzip -o "/tmp/${name}.zip" -d /usr/local/bin/
+  $SUDO chmod +x "/usr/local/bin/${name}"
+}
+
+install_tgz_bin(){ # name url
+  local name="$1" url="$2"
+  command -v "$name" >/dev/null 2>&1 && return 0
+  say "Installing $name…"
+  curl -fsSL -o "/tmp/${name}.tgz" "$url"
+  mkdir -p "/tmp/${name}-xz"
+  tar -xzf "/tmp/${name}.tgz" -C "/tmp/${name}-xz"
+  local bin
+  bin=$(find "/tmp/${name}-xz" -type f -name "$name" | head -n1 || true)
+  [ -n "$bin" ] || { nope "Failed to locate $name in archive"; }
+  $SUDO install -m0755 "$bin" "/usr/local/bin/${name}"
+}
+
+# Arch detect
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  armv7l) ARCH=arm ;;
+  *) say "Unknown arch $ARCH; URLs may need adjusting." ;;
+esac
+
+install_zip_bin terraform "1.9.5" "https://releases.hashicorp.com/terraform/1.9.5/terraform_1.9.5_linux_${ARCH}.zip"
+install_zip_bin packer    "1.11.2" "https://releases.hashicorp.com/packer/1.11.2/packer_1.11.2_linux_${ARCH}.zip"
+# Trivy prebuilt is x86_64-only in this URL; skip gracefully on others
+if [ "$ARCH" = "amd64" ]; then
+  install_tgz_bin trivy "https://github.com/aquasecurity/trivy/releases/download/v0.54.1/trivy_0.54.1_Linux-64bit.tar.gz" || true
+else
+  say "Skipping trivy prebuilt for ARCH=$ARCH; install manually later."
+fi
+
+# ------------------------------------------------------------
+# Ansible
+# ------------------------------------------------------------
+say "Installing Ansible…"
+$SUDO apt-get install -y ansible
+
+# ------------------------------------------------------------
+# Scaffold the ops project — inventories, vars, templates, playbook, compose
+# ------------------------------------------------------------
+say "Laying down /srv/ops/ansible…"
+$SUDO mkdir -p /srv/ops/ansible/templates
+# ownership fix: use $ME (not ${USER} which can be root)
+$SUDO chown -R "$ME":"$ME" /srv/ops
+cd /srv/ops/ansible
+
+# -------- inventory --------
+cat > inventory.ini <<'INI'
+[ops]
+localhost ansible_connection=local
+INI
+
+# -------- group vars --------
+mkdir -p group_vars
+cat > group_vars/all.yml <<'YAML'
+ops_domain: ""                  # optional, e.g. ops.example.com
+ops_listen_ip: "0.0.0.0"        # change to your LAN IP to limit exposure
+slack_webhook_url: ""           # set for Alertmanager
+telegram_bot_token: ""
+telegram_chat_id: ""
+
+enable_wireguard: false
+enable_crowdsec: false
+
+grafana_admin_password: "changeme"  # change post-install or set here
+
+# Prometheus targets (expand as you onboard servers)
+prom_targets:
+  - "localhost:9100"            # node_exporter on this box
+  - "localhost:9090"            # scrape prometheus itself
+YAML
+
+# -------- templates --------
+# Prometheus
+cat > templates/prometheus.yml.j2 <<'J2'
+global:
+  scrape_interval: 15s
+rule_files:
+  - /etc/prometheus/alert_rules.yml
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+  - job_name: 'nodes'
+    static_configs:
+      - targets: {{ prom_targets | to_json }}
+J2
+
+# Alertmanager (Slack optional)
+cat > templates/alertmanager.yml.j2 <<'J2'
+route:
+  receiver: default
+  group_by: ['alertname']
+  group_wait: 30s
+  repeat_interval: 3h
+receivers:
+  - name: default
+{% if slack_webhook_url|length > 0 %}
+  - name: slack
+    slack_configs:
+      - api_url: "{{ slack_webhook_url }}"
+        send_resolved: true
+        channel: "#alerts"
+        title: "{{ '{{' }} .CommonAnnotations.summary {{ '}}' }}"
+        text: "{{ '{{' }} range .Alerts {{ '}}' }}*{{ '{{' }} .Annotations.summary {{ '}}' }}* on {{ '{{' }} .Labels.instance {{ '}}' }}{{ '{{' }} end {{ '}}' }}"
+{% endif %}
+J2
+
+# Promtail (points to this box's Loki)
+cat > templates/promtail-config.yml.j2 <<'J2'
+server:
+  http_listen_port: 9080
+clients:
+  - url: "http://{{ ansible_default_ipv4.address }}:3100/loki/api/v1/push"
+positions:
+  filename: /var/lib/promtail/positions.yaml
+scrape_configs:
+  - job_name: system
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: varlogs
+          __path__: /var/log/**/*.log
+J2
+
+# Agent installer (for remote hosts)
+cat > templates/install-agents.sh.j2 <<'J2'
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v apt-get >/dev/null; then
+  sudo apt-get update -y && sudo apt-get install -y prometheus-node-exporter
+  sudo systemctl enable --now prometheus-node-exporter
+fi
+sudo mkdir -p /etc/promtail /var/lib/promtail
+cat <<CFG | sudo tee /etc/promtail/config.yml >/dev/null
+server: { http_listen_port: 9080 }
+clients: [ { url: "http://{{ ansible_default_ipv4.address }}:3100/loki/api/v1/push" } ]
+positions: { filename: /var/lib/promtail/positions.yaml }
+scrape_configs:
+  - job_name: varlogs
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: varlogs
+          __path__: /var/log/**/*.log
+CFG
+# Run promtail via Docker for simplicity
+sudo docker run -d --name promtail --restart unless-stopped \
+  -v /etc/promtail/config.yml:/etc/promtail/config.yml:ro \
+  -v /var/log:/var/log:ro \
+  -v /var/lib/promtail:/var/lib/promtail \
+  -p 9080:9080 \
+  grafana/promtail:2.9.8 -config.file=/etc/promtail/config.yml
+J2
+
+# -------- site playbook --------
+cat > site.yml <<'YAML'
+---
+- hosts: ops
+  become: true
+  vars_files:
+    - group_vars/all.yml
+
+  pre_tasks:
+    - name: Gather facts
+      setup:
+
+  tasks:
+    - name: Create ops directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        recurse: yes
+        mode: "0755"
+      loop:
+        - /srv/ops/compose
+        - /srv/ops/config
+        - /srv/ops/installers
+        - /srv/ops/data/prometheus
+        - /srv/ops/data/grafana
+        - /srv/ops/data/loki
+        - /srv/ops/data/registry
+        - /srv/ops/data/uptime-kuma
+        - /opt/ssh-ca
+
+    - name: Generate OpenSSH CA (once)
+      command: ssh-keygen -t ed25519 -f /opt/ssh-ca/ssh_ca -N "" -C "ops-ssh-ca"
+      args: { creates: /opt/ssh-ca/ssh_ca }
+
+    - name: Publish TrustedUserCAKeys
+      copy:
+        src: /opt/ssh-ca/ssh_ca.pub
+        dest: /etc/ssh/trusted-user-ca-keys.pem
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Enforce CA trust in sshd
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^TrustedUserCAKeys'
+        line: 'TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem'
+        create: yes
+        backup: yes
+
+    - name: Reload SSH
+      service: { name: ssh, state: reloaded }
+
+    - name: Signer helper
+      copy:
+        dest: /usr/local/bin/ssh-sign
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          # ssh-sign <user_pubkey_file> <principals> <hours_valid>
+          set -euo pipefail
+          PUB="${1:-}"; PRIN="${2:-$USER}"; HRS="${3:-24}"
+          [[ -f "$PUB" ]] || { echo "Need a public key file"; exit 1; }
+          ssh-keygen -s /opt/ssh-ca/ssh_ca -I "$PRIN" -n "$PRIN" -V +"${HRS}"h "$PUB"
+          echo "Signed cert: ${PUB}-cert.pub (valid ${HRS}h for ${PRIN})"
+
+    # -------- UFW: safe sequence --------
+    - name: UFW allow SSH before enabling
+      ufw:
+        rule: allow
+        port: "22"
+
+    - name: Set UFW defaults (deny inbound, allow outbound) but don't enable yet
+      ufw:
+        state: disabled
+        policy: deny
+
+    - name: Allow required ports
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+      loop:
+        - "22"    # SSH
+        - "3000"  # Grafana
+        - "9090"  # Prometheus
+        - "9093"  # Alertmanager
+        - "3100"  # Loki
+        - "9000"  # Portainer
+        - "5000"  # Registry
+        - "3001"  # Uptime Kuma
+      notify: enable ufw
+
+    - name: Fail2ban config (basic ssh)
+      copy:
+        dest: /etc/fail2ban/jail.d/ssh.local
+        content: |
+          [sshd]
+          enabled = true
+          maxretry = 6
+          bantime = 1h
+          findtime = 10m
+      notify: restart fail2ban
+
+    # -------- Docker daemon.json --------
+    - name: Configure Docker log rotation + BuildKit
+      copy:
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": { "max-size": "10m", "max-file": "5" },
+            "features": { "buildkit": true }
+          }
+      notify: restart docker
+
+    - name: Ensure node exporter installed
+      apt:
+        name: prometheus-node-exporter
+        state: present
+        update_cache: yes
+
+    - name: Enable node exporter service
+      service: { name: prometheus-node-exporter, state: started, enabled: true }
+
+    - name: Prometheus config
+      template:
+        src: templates/prometheus.yml.j2
+        dest: /srv/ops/config/prometheus.yml
+        mode: "0644"
+
+    - name: Alertmanager config
+      template:
+        src: templates/alertmanager.yml.j2
+        dest: /srv/ops/config/alertmanager.yml
+        mode: "0644"
+
+    # -------- Prometheus alert rules file (bind mount target) --------
+    - name: Ensure Prometheus alert rules file exists
+      copy:
+        dest: /srv/ops/config/alert_rules.yml
+        mode: "0644"
+        content: |
+          groups:
+            - name: basic-host
+              rules:
+                - alert: HostDown
+                  expr: up == 0
+                  for: 2m
+                  labels:
+                    severity: critical
+                  annotations:
+                    summary: "Instance {{ $labels.instance }} is down"
+
+    - name: Loki config
+      copy:
+        dest: /srv/ops/config/loki-config.yml
+        mode: "0644"
+        content: |
+          auth_enabled: false
+          server: { http_listen_port: 3100 }
+          common:
+            path_prefix: /loki
+          storage_config:
+            filesystem: { }
+          schema_config:
+            configs:
+              - from: 2020-10-24
+                store: boltdb-shipper
+                object_store: filesystem
+                schema: v11
+                index:
+                  prefix: index_
+                  period: 24h
+
+    # -------- Promtail state dir --------
+    - name: Ensure promtail state dir exists
+      file:
+        path: /var/lib/promtail
+        state: directory
+        mode: "0755"
+
+    - name: Promtail config (this host)
+      template:
+        src: templates/promtail-config.yml.j2
+        dest: /srv/ops/config/promtail-config.yml
+        mode: "0644"
+
+    # -------- Grafana provisioning (no click-ops) --------
+    - name: Grafana provisioning dirs
+      file:
+        path: /srv/ops/config/grafana/provisioning/datasources
+        state: directory
+        mode: "0755"
+
+    - name: Grafana default datasources
+      copy:
+        dest: /srv/ops/config/grafana/provisioning/datasources/datasources.yml
+        mode: "0644"
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              type: prometheus
+              access: proxy
+              url: http://prometheus:9090
+              isDefault: true
+            - name: Loki
+              type: loki
+              access: proxy
+              url: http://loki:3100
+
+    - name: Compose file for ops stack
+      copy:
+        dest: /srv/ops/compose/ops.yml
+        mode: "0644"
+        content: |
+          services:
+            prometheus:
+              image: prom/prometheus:v2.55.0
+              command: ["--config.file=/etc/prometheus/prometheus.yml","--web.enable-lifecycle","--web.route-prefix=/"]
+              volumes:
+                - /srv/ops/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+                - /srv/ops/config/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+                - prometheus:/prometheus
+                # Bind-mount alternative (pick one, then remove named volume "prometheus" below):
+                # - /srv/ops/data/prometheus:/prometheus
+              ports: ["9090:9090"]
+              restart: unless-stopped
+            alertmanager:
+              image: prom/alertmanager:v0.27.0
+              volumes:
+                - /srv/ops/config/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+              ports: ["9093:9093"]
+              restart: unless-stopped
+            grafana:
+              image: grafana/grafana:10.4.6
+              environment:
+                - GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password }}
+              volumes:
+                - grafana:/var/lib/grafana
+                - /srv/ops/config/grafana/provisioning:/etc/grafana/provisioning:ro
+              ports: ["3000:3000"]
+              restart: unless-stopped
+            loki:
+              image: grafana/loki:2.9.8
+              command: ["-config.file=/etc/loki/loki-config.yml"]
+              volumes:
+                - /srv/ops/config/loki-config.yml:/etc/loki/loki-config.yml:ro
+                - loki:/loki
+              ports: ["3100:3100"]
+              restart: unless-stopped
+            promtail:
+              image: grafana/promtail:2.9.8
+              command: ["-config.file=/etc/promtail/config.yml"]
+              volumes:
+                - /srv/ops/config/promtail-config.yml:/etc/promtail/config.yml:ro
+                - /var/log:/var/log:ro
+                - /var/lib/promtail:/var/lib/promtail
+              restart: unless-stopped
+            portainer:
+              image: portainer/portainer-ce:2.21.4
+              volumes:
+                - /var/run/docker.sock:/var/run/docker.sock
+                - portainer:/data
+              ports: ["9000:9000"]
+              restart: unless-stopped
+            registry:
+              image: registry:2
+              environment:
+                REGISTRY_STORAGE_DELETE_ENABLED: "true"
+              volumes:
+                - registry:/var/lib/registry
+              ports: ["5000:5000"]
+              restart: unless-stopped
+            uptime-kuma:
+              image: louislam/uptime-kuma:1
+              volumes:
+                - uptimekuma:/app/data
+              ports: ["3001:3001"]
+              restart: unless-stopped
+          volumes:
+            prometheus: {}
+            grafana: {}
+            loki: {}
+            portainer: {}
+            registry: {}
+            uptimekuma: {}
+
+    - name: Installer: add-trust-ca.sh (trust SSH CA on targets)
+      copy:
+        dest: /srv/ops/installers/add-trust-ca.sh
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          # Usage: add-trust-ca.sh <URL or /path/to/ssh_ca.pub>
+          set -euo pipefail
+          SRC="${1:-}"
+          TMP="$(mktemp)"
+          if [[ -z "${SRC}" ]]; then
+            echo "Usage: $0 <URL or /path/to/ssh_ca.pub>" >&2; exit 2
+          fi
+          if [[ "${SRC}" =~ ^https?:// ]]; then
+            curl -fsSL "${SRC}" -o "${TMP}"
+          else
+            [[ -f "${SRC}" ]] || { echo "No such file: ${SRC}" >&2; exit 2; }
+            cp -f "${SRC}" "${TMP}"
+          fi
+          sudo install -m0644 "${TMP}" /etc/ssh/trusted-user-ca-keys.pem
+          rm -f "${TMP}"
+          if grep -qE '^\s*TrustedUserCAKeys\b' /etc/ssh/sshd_config; then
+            sudo sed -i 's#^\s*TrustedUserCAKeys.*#TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem#' /etc/ssh/sshd_config
+          else
+            echo 'TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          fi
+          if systemctl list-unit-files | grep -q '^ssh\.service'; then
+            sudo systemctl restart ssh
+          else
+            sudo systemctl restart sshd || true
+          fi
+          echo "Trusted SSH CA installed."
+
+    - name: Generate installer: node_exporter + promtail
+      template:
+        src: templates/install-agents.sh.j2
+        dest: /srv/ops/installers/install-agents.sh
+        mode: "0755"
+
+    - name: Systemd unit for ops compose
+      copy:
+        dest: /etc/systemd/system/ops-compose.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Ops Compose Stack
+          After=docker.service
+          Requires=docker.service
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          WorkingDirectory=/srv/ops/compose
+          ExecStart=/usr/bin/docker compose -f /srv/ops/compose/ops.yml up -d
+          ExecStop=/usr/bin/docker compose -f /srv/ops/compose/ops.yml down
+          [Install]
+          WantedBy=multi-user.target
+      notify: reload systemd
+
+    - name: Enable & start ops stack
+      systemd:
+        name: ops-compose.service
+        enabled: true
+        state: started
+
+  handlers:
+    - name: enable ufw
+      ufw: { state: enabled }
+
+    - name: restart fail2ban
+      service: { name: fail2ban, state: restarted, enabled: true }
+
+    - name: reload systemd
+      systemd: { daemon_reload: true }
+
+    - name: restart docker
+      service: { name: docker, state: restarted }
+YAML
+
+# ------------------------------------------------------------
+# Run the playbook
+# ------------------------------------------------------------
+say "Running Ansible (local)…"
+ansible-playbook -i inventory.ini site.yml
+
+# ------------------------------------------------------------
+# Exit banner
+# ------------------------------------------------------------
+IP_NOW=$(hostname -I | awk '{print $1}')
+say "Done. If you were added to the docker group, log out/in. URLs:"
+say " Grafana       : http://$IP_NOW:3000 (admin / see group_vars/all.yml: grafana_admin_password)"
+say " Prometheus    : http://$IP_NOW:9090"
+say " Alertmanager  : http://$IP_NOW:9093"
+say " Loki (API)    : http://$IP_NOW:3100"
+say " Portainer     : http://$IP_NOW:9000"
+say " Registry      : http://$IP_NOW:5000 (use docker login)"
+say " Uptime Kuma   : http://$IP_NOW:3001"
