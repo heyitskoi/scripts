@@ -17,7 +17,9 @@ nope(){ printf "\033[1;31m[!]\033[0m %s\n" "$*" >&2; exit 1; }
 # ------------------------------------------------------------
 [ "$(id -u)" -eq 0 ] && SUDO="" || SUDO="sudo"
 . /etc/os-release || nope "Unknown OS."
-[[ "${ID}" =~ (ubuntu|debian) ]] || nope "Use Ubuntu/Debian for this bootstrap."
+if [[ ! "${ID}" =~ (ubuntu|debian) ]] && [[ ! "${ID_LIKE:-}" =~ (ubuntu|debian) ]]; then
+  nope "Use Ubuntu/Debian for this bootstrap."
+fi
 
 # ------------------------------------------------------------
 # Base packages
@@ -44,7 +46,7 @@ install_docker(){
 
   $SUDO install -m 0755 -d /etc/apt/keyrings
   [ -f /etc/apt/keyrings/docker.gpg ] || \
-    curl -fsSL https://download.docker.com/linux/${ID}/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    curl -fsSL "https://download.docker.com/linux/${ID}/gpg" | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 
   if [ ! -f /etc/apt/sources.list.d/docker.list ]; then
     arch=$(dpkg --print-architecture)
