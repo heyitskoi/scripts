@@ -43,6 +43,17 @@ REGISTRY_VERSION="${REGISTRY_VERSION:-2}"
 UPTIME_KUMA_VERSION="${UPTIME_KUMA_VERSION:-1}"
 
 # ------------------------------------------------------------
+# CLI modes: run (default), dry-run, health
+# ------------------------------------------------------------
+MODE="${1:-run}"   # run | dry-run | health
+case "$MODE" in
+  run) : ;;
+  dry-run) export DRY_RUN=1 ;;
+  health) export HEALTH_ONLY=1 ;;
+  *) nope "Unknown mode: $MODE (use: run|dry-run|health)";;
+esac
+
+# ------------------------------------------------------------
 # Sanity checks
 # ------------------------------------------------------------
 [ "$(id -u)" -eq 0 ] && SUDO="" || SUDO="sudo"
@@ -59,12 +70,22 @@ if [[ ! "${ID}" =~ (ubuntu|debian) ]] && [[ ! "${ID_LIKE:-}" =~ (ubuntu|debian) 
   nope "Use Ubuntu/Debian for this bootstrap."
 fi
 
+# Retry wrapper for apt-get commands
+apt_retry(){ # args: apt-get subcommand + options
+  local n=0; until [ $n -ge 3 ]; do
+    $SUDO apt-get "$@" && break
+    n=$((n+1)); sleep 3
+    say "apt-get retry $n…"
+  done
+  [ $n -lt 3 ] || nope "apt-get failed after retries: $*"
+}
+
 # ------------------------------------------------------------
 # Base packages
 # ------------------------------------------------------------
 say "Updating packages…"
-$SUDO apt-get update -y
-$SUDO apt-get install -y --no-install-recommends \
+apt_retry update -y
+apt_retry install -y --no-install-recommends \
   ca-certificates gnupg lsb-release curl git unzip tar make jq \
   ufw fail2ban python3 python3-pip nmap
 
@@ -92,8 +113,8 @@ install_docker(){
     echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${codename} stable" | \
       $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
   fi
-  $SUDO apt-get update -y
-  $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  apt_retry update -y
+  apt_retry install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   $SUDO systemctl enable --now docker
 }
 install_docker
@@ -186,7 +207,7 @@ fi
 # Ansible
 # ------------------------------------------------------------
 say "Installing Ansible…"
-$SUDO apt-get install -y ansible
+apt_retry install -y ansible
 
 # ------------------------------------------------------------
 # Scaffold the ops project — inventories, vars, templates, playbook, compose
@@ -206,7 +227,8 @@ INI
 # -------- group vars --------
 mkdir -p group_vars
 cat > group_vars/all.yml <<'YAML'
-ops_domain: ""                  # optional, e.g. ops.example.com
+# Optional front-door hostnames (for proxy/TLS later)
+ops_domain: ""  # e.g., ops.example.com
 ops_listen_ip: "0.0.0.0"        # change to your LAN IP to limit exposure
 slack_webhook_url: ""           # set for Alertmanager
 telegram_bot_token: ""
@@ -227,10 +249,16 @@ crowdsec_log_files:
 
 grafana_admin_password: "changeme"  # change post-install or set here
 
+# Multinode-curious knobs (safe defaults for single host)
+prom_host: "localhost"
+loki_host: "localhost"
+grafana_host: "localhost"
+
+prometheus_url: "http://{{ prom_host }}:9090"
+loki_url:       "http://{{ loki_host }}:3100"
+
 # Prometheus targets (expand as you onboard servers)
-prom_targets:
-  # Add more targets like "10.0.0.12:9100", "web-1:9100" etc. The local host is auto-added.
-  - "localhost:9090"            # scrape prometheus itself
+prom_targets: []  # Add more targets like "10.0.0.12:9100", "web-1:9100" etc. The local host is auto-added.
 YAML
 
 # -------- templates --------
@@ -252,7 +280,7 @@ J2
 # Alertmanager (Slack optional)
 cat > templates/alertmanager.yml.j2 <<'J2'
 route:
-  receiver: default
+  receiver: {{ 'slack' if slack_webhook_url|length > 0 else 'default' }}
   group_by: ['alertname']
   group_wait: 30s
   repeat_interval: 3h
@@ -276,7 +304,7 @@ cat > templates/promtail-config.yml.j2 <<'J2'
 server:
   http_listen_port: 9080
 clients:
-  - url: "http://loki:3100/loki/api/v1/push"
+  - url: "{{ loki_url }}/loki/api/v1/push"
 positions:
   filename: /var/lib/promtail/positions.yaml
 scrape_configs:
@@ -293,7 +321,16 @@ cat > templates/install-agents.sh.j2 <<'J2'
 #!/usr/bin/env bash
 set -euo pipefail
 if command -v apt-get >/dev/null; then
-  sudo apt-get update -y && sudo apt-get install -y prometheus-node-exporter
+  apt_retry(){ # args: apt-get subcommand + options
+    local n=0; until [ $n -ge 3 ]; do
+      sudo apt-get "$@" && break
+      n=$((n+1)); sleep 3
+      echo "apt-get retry $n…" >&2
+    done
+    [ $n -lt 3 ]
+  }
+  apt_retry update -y
+  apt_retry install -y prometheus-node-exporter
   sudo systemctl enable --now prometheus-node-exporter
 fi
 sudo mkdir -p /etc/promtail /var/lib/promtail
@@ -629,6 +666,8 @@ cat > site.yml <<'YAML'
         mode: "0644"
         content: |
           services:
+            # For internet exposure: put behind a reverse proxy (Traefik/Nginx) with TLS.
+            # These ports are LAN-facing convenience only.
             prometheus:
               image: prom/prometheus:__PROMETHEUS_VERSION__
               command: ["--config.file=/etc/prometheus/prometheus.yml","--web.enable-lifecycle","--web.route-prefix=/"]
@@ -758,6 +797,19 @@ cat > site.yml <<'YAML'
           WantedBy=multi-user.target
       notify: reload systemd
 
+    - name: Drop uninstaller helper
+      copy:
+        dest: /srv/ops/uninstall.sh
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          systemctl stop ops-compose.service || true
+          docker compose -f /srv/ops/compose/ops.yml down -v || true
+          rm -f /etc/systemd/system/ops-compose.service
+          systemctl daemon-reload || true
+          echo "Stack removed. Config remains in /srv/ops."
+
     - name: Enable & start ops stack
       systemd:
         name: ops-compose.service
@@ -797,40 +849,48 @@ sed -i \
 # ------------------------------------------------------------
 # Run the playbook
 # ------------------------------------------------------------
-say "Running Ansible (local)…"
-ansible-playbook -i inventory.ini site.yml
+if [ -z "${HEALTH_ONLY:-}" ]; then
+  say "Running Ansible (local)…"
+  if [ -n "${DRY_RUN:-}" ]; then
+    ansible-playbook -i inventory.ini site.yml --check --diff
+  else
+    ansible-playbook -i inventory.ini site.yml
+  fi
+fi
 
 # ------------------------------------------------------------
 # Service health checks
 # ------------------------------------------------------------
-say "Checking services…"
-fail=0
-cd /srv/ops/compose
-docker compose -f ops.yml ps || fail=1
+if [ -z "${DRY_RUN:-}" ]; then
+  say "Checking services…"
+  fail=0
+  cd /srv/ops/compose
+  docker compose -f ops.yml ps || fail=1
 
-probe(){ # name url
-  local name="$1" url="$2" retries=3 i
-  for i in $(seq "$retries"); do
-    if curl -fsS --connect-timeout 5 --max-time 10 "$url" >/dev/null 2>&1; then
-      say "$name responding at $url"
-      return 0
-    fi
-    sleep 3
-  done
-  say "$name FAILED at $url"
-  fail=1
-}
+  probe(){ # name url
+    local name="$1" url="$2" retries=3 i
+    for i in $(seq "$retries"); do
+      if curl -fsS --connect-timeout 5 --max-time 10 "$url" >/dev/null 2>&1; then
+        say "$name responding at $url"
+        return 0
+      fi
+      sleep 3
+    done
+    say "$name FAILED at $url"
+    fail=1
+  }
 
-probe "Grafana"      "http://localhost:3000/login"
-probe "Prometheus"   "http://localhost:9090/-/ready"
-probe "Alertmanager" "http://localhost:9093/-/ready"
-probe "Loki"         "http://localhost:3100/ready"
-probe "Portainer"    "http://localhost:9000"
-probe "Registry"     "http://localhost:5000/v2/"
-probe "Uptime Kuma"  "http://localhost:3001"
+  probe "Grafana"      "http://localhost:3000/login"
+  probe "Prometheus"   "http://localhost:9090/-/ready"
+  probe "Alertmanager" "http://localhost:9093/-/ready"
+  probe "Loki"         "http://localhost:3100/ready"
+  probe "Portainer"    "http://localhost:9000"
+  probe "Registry"     "http://localhost:5000/v2/"
+  probe "Uptime Kuma"  "http://localhost:3001"
 
-if [ "$fail" -ne 0 ]; then
-  nope "Service checks failed. Use 'docker compose -f /srv/ops/compose/ops.yml ps' and inspect logs."
+  if [ "$fail" -ne 0 ]; then
+    nope "Service checks failed. Use 'docker compose -f /srv/ops/compose/ops.yml ps' and inspect logs."
+  fi
 fi
 
 # ------------------------------------------------------------
