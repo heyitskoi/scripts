@@ -30,9 +30,9 @@ trap 'nope "Failed at line $LINENO. See $LOG_FILE for details."' ERR
 
 LOCK_FILE=${LOCK_FILE:-/var/lock/supersetup.lock}
 if [ -n "$SUDO" ]; then
-  $SUDO install -m 0644 /dev/null "$LOCK_FILE" 2>/dev/null || {
+  $SUDO install -m 0600 /dev/null "$LOCK_FILE" 2>/dev/null || {
     LOCK_FILE=/run/lock/supersetup.lock
-    $SUDO install -m 0644 /dev/null "$LOCK_FILE" 2>/dev/null || true
+    $SUDO install -m 0600 /dev/null "$LOCK_FILE" 2>/dev/null || true
   }
 fi
 exec 9>>"$LOCK_FILE" || nope "Cannot open lock file $LOCK_FILE"
@@ -92,26 +92,24 @@ apt_retry(){ # args: apt-get subcommand + options
   done
   [ $n -lt 3 ] || nope "apt-get failed after retries: $*"
 }
-
+DRY_RUN_ONLY=0
 if [ "${MODE:-run}" = "dry-run" ]; then
-  say "DRY RUN: validating environment only (no installs/scaffold)."
-  exit 0
+  say "DRY RUN: skip package installs; still scaffold + run Ansible --check."
+  DRY_RUN_ONLY=1
 fi
 
 # ------------------------------------------------------------
 # Base packages
 # ------------------------------------------------------------
-say "Updating packages…"
-apt_retry update
-# Optional but useful to keep the base system fresh without prompts
-apt_retry -o Dpkg::Options::="--force-confnew" -y dist-upgrade || true
-apt_retry install -y --no-install-recommends \
-  ca-certificates gnupg lsb-release curl git unzip tar make jq \
-  ufw fail2ban python3 python3-pip nmap
-
-# Import HashiCorp release key for signature verification (also used for zip checks below)
-$SUDO install -m0755 -d /usr/share/keyrings
-curl -fsSL https://apt.releases.hashicorp.com/gpg | $SUDO gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+if [ "$DRY_RUN_ONLY" -eq 0 ]; then
+  say "Updating packages…"
+  apt_retry update
+  # Optional but useful to keep the base system fresh without prompts
+  apt_retry -o Dpkg::Options::="--force-confnew" -y dist-upgrade || true
+  apt_retry install -y --no-install-recommends \
+    ca-certificates gnupg lsb-release curl git unzip tar make jq \
+    ufw fail2ban python3 python3-pip nmap
+fi
 
 # ------------------------------------------------------------
 # Docker CE (official repo)
@@ -141,10 +139,11 @@ install_docker(){
   apt_retry install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   $SUDO systemctl enable --now docker
 }
-install_docker
-
-if [ "$ME" != "root" ]; then
-  $SUDO usermod -aG docker "$ME" || true
+if [ "$DRY_RUN_ONLY" -eq 0 ]; then
+  install_docker
+  if [ "$ME" != "root" ]; then
+    $SUDO usermod -aG docker "$ME" || true
+  fi
 fi
 
 # ------------------------------------------------------------
@@ -171,29 +170,6 @@ install_zip_bin(){ # name ver url sha256
   $SUDO ln -sfn "/usr/local/bin/${name}-${ver}" "/usr/local/bin/${name}"
   rm -f "$tmp"
 }
-
-install_zip_bin_gpg(){ # name ver url sig_url keyring
-  local name="$1" ver="$2" url="$3" sig_url="$4" keyring="$5"
-  if command -v "$name" >/dev/null 2>&1 && "$name" version 2>/dev/null | grep -q "$ver"; then
-    return 0
-  fi
-  say "Installing $name $ver…"
-  local tmp tmp_sig
-  tmp=$(mktemp "/tmp/${name}.XXXXXX.zip")
-  tmp_sig="$tmp.sig"
-  curl -fsSL -o "$tmp" "$url"
-  curl -fsSL -o "$tmp_sig" "$sig_url"
-  if ! gpg --no-default-keyring --keyring "$keyring" --verify "$tmp_sig" "$tmp" >/dev/null 2>&1; then
-    rm -f "$tmp" "$tmp_sig"
-    nope "$name signature verification failed"
-  fi
-  $SUDO unzip -o "$tmp" -d /usr/local/bin/
-  $SUDO chmod +x "/usr/local/bin/${name}"
-  $SUDO mv "/usr/local/bin/${name}" "/usr/local/bin/${name}-${ver}"
-  $SUDO ln -sfn "/usr/local/bin/${name}-${ver}" "/usr/local/bin/${name}"
-  rm -f "$tmp" "$tmp_sig"
-}
-
 install_tgz_bin(){ # name ver url sha256
   local name="$1" ver="$2" url="$3" sha="$4"
   if command -v "$name" >/dev/null 2>&1 && "$name" version 2>/dev/null | grep -q "$ver"; then
@@ -222,6 +198,40 @@ install_tgz_bin(){ # name ver url sha256
   rm -rf "$tmpdir"
 }
 
+import_hashicorp_release_key() {
+  gpg --list-keys "HashiCorp" >/dev/null 2>&1 && return 0
+  curl -fsSL https://keybase.io/hashicorp/pgp_keys.asc | gpg --import -
+}
+
+verify_hashicorp_sums() { # name ver
+  local name="$1" ver="$2" base="https://releases.hashicorp.com/${name}/${ver}"
+  local sums="/tmp/${name}_${ver}_SHA256SUMS"
+  curl -fsSL -o "${sums}"      "${base}/${name}_${ver}_SHA256SUMS"
+  curl -fsSL -o "${sums}.sig"  "${base}/${name}_${ver}_SHA256SUMS.sig"
+  gpg --verify "${sums}.sig" "${sums}" >/dev/null 2>&1 \
+    || nope "Invalid ${name} SHASUMS signature"
+  echo "${sums}"
+}
+
+install_zip_bin_hc(){ # name ver arch
+  local name="$1" ver="$2" arch="$3" sums url tmp want got
+  command -v "$name" >/dev/null 2>&1 && "$name" version 2>/dev/null | grep -q "$ver" && return 0
+  say "Installing $name $ver…"
+  url="https://releases.hashicorp.com/${name}/${ver}/${name}_${ver}_linux_${arch}.zip"
+  import_hashicorp_release_key
+  sums="$(verify_hashicorp_sums "$name" "$ver")"
+  want="$(grep " ${name}_${ver}_linux_${arch}.zip" "$sums" | awk '{print $1}')"
+  tmp="$(mktemp "/tmp/${name}.XXXXXX.zip")"
+  curl -fsSL -o "$tmp" "$url"
+  got="$(sha256sum "$tmp" | awk '{print $1}')"
+  [ "$got" = "$want" ] || { rm -f "$tmp"; nope "$name checksum mismatch"; }
+  $SUDO unzip -o "$tmp" -d /usr/local/bin/
+  $SUDO chmod +x "/usr/local/bin/${name}"
+  $SUDO mv "/usr/local/bin/${name}" "/usr/local/bin/${name}-${ver}"
+  $SUDO ln -sfn "/usr/local/bin/${name}-${ver}" "/usr/local/bin/${name}"
+  rm -f "$tmp" "$sums" "${sums}.sig"
+}
+
 # Arch detect
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -230,37 +240,33 @@ case "$ARCH" in
   armv7l) ARCH=arm ;;
   *) say "Unknown arch $ARCH; URLs may need adjusting." ;;
 esac
-
-# Terraform
-tf_url="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip"
-tf_sig="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip.sig"
-install_zip_bin_gpg terraform "$TERRAFORM_VERSION" "$tf_url" "$tf_sig" "/usr/share/keyrings/hashicorp.gpg"
-
-# Packer
-packer_url="https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_${ARCH}.zip"
-packer_sig="https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_${ARCH}.zip.sig"
-install_zip_bin_gpg packer "$PACKER_VERSION" "$packer_url" "$packer_sig" "/usr/share/keyrings/hashicorp.gpg"
+[ "$DRY_RUN_ONLY" -eq 0 ] && install_zip_bin_hc terraform "$TERRAFORM_VERSION" "$ARCH"
+[ "$DRY_RUN_ONLY" -eq 0 ] && install_zip_bin_hc packer "$PACKER_VERSION" "$ARCH"
 
 # Trivy (prebuilt for amd64 and arm64)
-if [ "$ARCH" = "amd64" ]; then
-  trivy_url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-  trivy_sha="$(curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt" \
-    | grep "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" | awk '{print $1}')"
-  install_tgz_bin trivy "$TRIVY_VERSION" "$trivy_url" "$trivy_sha" || true
-elif [ "$ARCH" = "arm64" ]; then
-  trivy_url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz"
-  trivy_sha="$(curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt" \
-    | grep "trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz" | awk '{print $1}')"
-  install_tgz_bin trivy "$TRIVY_VERSION" "$trivy_url" "$trivy_sha" || true
-else
-  say "Skipping trivy prebuilt for ARCH=$ARCH; install manually later."
+if [ "$DRY_RUN_ONLY" -eq 0 ]; then
+  if [ "$ARCH" = "amd64" ]; then
+    trivy_url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+    trivy_sha="$(curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt" \
+      | grep "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" | awk '{print $1}')"
+    install_tgz_bin trivy "$TRIVY_VERSION" "$trivy_url" "$trivy_sha" || true
+  elif [ "$ARCH" = "arm64" ]; then
+    trivy_url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz"
+    trivy_sha="$(curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt" \
+      | grep "trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz" | awk '{print $1}')"
+    install_tgz_bin trivy "$TRIVY_VERSION" "$trivy_url" "$trivy_sha" || true
+  else
+    say "Skipping trivy prebuilt for ARCH=$ARCH; install manually later."
+  fi
 fi
 
 # ------------------------------------------------------------
 # Ansible
 # ------------------------------------------------------------
-say "Installing Ansible…"
-apt_retry install -y ansible
+if [ "$DRY_RUN_ONLY" -eq 0 ]; then
+  say "Installing Ansible…"
+  apt_retry install -y ansible
+fi
 
 # ------------------------------------------------------------
 # Scaffold the ops project — inventories, vars, templates, playbook, compose
@@ -363,6 +369,35 @@ receivers:
         text: |
           {{ '{{' }} range .Alerts {{ '}}' }}*{{ '{{' }} .Annotations.summary {{ '}}' }}* on {{ '{{' }} .Labels.instance {{ '}}' }}{{ '{{' }} end {{ '}}' }}
 {% endif %}
+J2
+
+# Prometheus alert rules (raw to preserve Go templating)
+cat > templates/alert_rules.yml.j2 <<'J2'
+{% raw %}
+groups:
+  - name: basic-host
+    rules:
+      - alert: HostDown
+        expr: up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "Instance {{ $labels.instance }} is down" }
+      - alert: HostDiskAlmostFull
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.10
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Root disk on {{ $labels.instance }} is almost full" }
+      - alert: PrometheusDiskSpaceLow
+        expr: prometheus_tsdb_low_storage_space == 1
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Prometheus TSDB storage is almost full" }
+      - alert: GrafanaDown
+        expr: up{job="grafana"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "Grafana is down" }
+{% endraw %}
 J2
 
 # Promtail (points to this box's Loki)
@@ -693,18 +728,22 @@ cat > site.yml <<'YAML'
         name: prometheus-node-exporter
         state: present
         update_cache: yes
+    
+    - name: Ensure node exporter override dir
+      file:
+        path: /etc/systemd/system/prometheus-node-exporter.service.d
+        state: directory
+        mode: "0755"
 
-    - name: Bind node exporter to loopback
+    - name: Bind node exporter on all interfaces (restricted by UFW)
       copy:
         dest: /etc/systemd/system/prometheus-node-exporter.service.d/override.conf
         mode: "0644"
         content: |
           [Service]
           ExecStart=
-          ExecStart=/usr/bin/prometheus-node-exporter --web.listen-address=127.0.0.1:9100
-      notify:
-        - reload systemd
-        - restart node exporter
+          ExecStart=/usr/bin/prometheus-node-exporter --web.listen-address=:9100
+      notify: [reload systemd, restart node exporter]
 
     - name: Enable node exporter service
       service: { name: prometheus-node-exporter, state: started, enabled: true }
@@ -720,44 +759,11 @@ cat > site.yml <<'YAML'
         src: templates/alertmanager.yml.j2
         dest: /srv/ops/config/alertmanager.yml
         mode: "0644"
-
-    # -------- Prometheus alert rules file (bind mount target) --------
-    - name: Ensure Prometheus alert rules file exists
-      copy:
+    - name: Prometheus alert rules (template; preserve Go templates)
+      template:
+        src: templates/alert_rules.yml.j2
         dest: /srv/ops/config/alert_rules.yml
         mode: "0644"
-        content: |
-          groups:
-            - name: basic-host
-              rules:
-                - alert: HostDown
-                  expr: up == 0
-                  for: 2m
-                  labels:
-                    severity: critical
-                  annotations:
-                    summary: "Instance {{ $labels.instance }} is down"
-                - alert: HostDiskAlmostFull
-                  expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.10
-                  for: 5m
-                  labels:
-                    severity: warning
-                  annotations:
-                    summary: "Root disk on {{ $labels.instance }} is almost full"
-                - alert: PrometheusDiskSpaceLow
-                  expr: prometheus_tsdb_low_storage_space == 1
-                  for: 5m
-                  labels:
-                    severity: warning
-                  annotations:
-                    summary: "Prometheus TSDB storage is almost full"
-                - alert: GrafanaDown
-                  expr: up{job="grafana"} == 0
-                  for: 2m
-                  labels:
-                    severity: critical
-                  annotations:
-                    summary: "Grafana is down"
 
     - name: Loki config
       copy:
@@ -875,8 +881,8 @@ cat > site.yml <<'YAML'
 
     - name: Display Portainer admin password
       debug:
-        msg: "Portainer admin password: {{ portainer_pw_plain.stdout }}"
-      when: portainer_pw_plain is defined
+        msg: "Portainer admin password (store securely): {{ portainer_pw_plain.stdout }}"
+      when: portainer_pw_plain is defined and (not ansible_check_mode|default(false))
 
     - name: Compose file for ops stack
       copy:
