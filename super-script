@@ -201,20 +201,20 @@ install_tgz_bin(){ # name ver url sha256
 }
 
 import_hashicorp_release_key() {
-  gpg --list-keys "HashiCorp" >/dev/null 2>&1 && return 0
-  curl -fsSL https://keybase.io/hashicorp/pgp_keys.asc | gpg --import -
-  expected="91A6E7F85D05C65630BEF18951852D87348FFC4C"  # update if rotated
-  gpg --fingerprint --with-colons "HashiCorp" | grep -q "$expected" \
-    || nope "HashiCorp PGP fingerprint mismatch"
+  GNUPGHOME="$(mktemp -d)"; export GNUPGHOME
+  curl -fsSL https://www.hashicorp.com/.well-known/pgp-key.txt | gpg --import
+  expected="C874011F0AB405110D02105534365D9472D7468F"
+  gpg --fingerprint --with-colons "HashiCorp Security" | grep -q "$expected" \
+    || { rm -rf "$GNUPGHOME"; nope "HashiCorp PGP fingerprint mismatch"; }
 }
 
-verify_hashicorp_sums() { # name ver
+verify_hashicorp_sums() { # name ver -> echos path to sums file
   local name="$1" ver="$2" base="https://releases.hashicorp.com/${name}/${ver}"
   local sums="/tmp/${name}_${ver}_SHA256SUMS"
-  curl -fsSL -o "${sums}"      "${base}/${name}_${ver}_SHA256SUMS"
-  curl -fsSL -o "${sums}.sig"  "${base}/${name}_${ver}_SHA256SUMS.sig"
+  curl -fsSLo "${sums}"     "${base}/${name}_${ver}_SHA256SUMS"
+  curl -fsSLo "${sums}.sig" "${base}/${name}_${ver}_SHA256SUMS.sig"
   gpg --verify "${sums}.sig" "${sums}" >/dev/null 2>&1 \
-    || nope "Invalid ${name} SHASUMS signature"
+    || { rm -rf "$GNUPGHOME"; nope "Invalid ${name} SHASUMS signature"; }
   echo "${sums}"
 }
 
@@ -227,14 +227,15 @@ install_zip_bin_hc(){ # name ver arch
   sums="$(verify_hashicorp_sums "$name" "$ver")"
   want="$(grep " ${name}_${ver}_linux_${arch}.zip" "$sums" | awk '{print $1}')"
   tmp="$(mktemp "/tmp/${name}.XXXXXX.zip")"
-  curl -fsSL -o "$tmp" "$url"
+  curl -fsSLo "$tmp" "$url"
   got="$(sha256sum "$tmp" | awk '{print $1}')"
-  [ "$got" = "$want" ] || { rm -f "$tmp"; nope "$name checksum mismatch"; }
+  [ "$got" = "$want" ] || { rm -f "$tmp"; rm -rf "$GNUPGHOME"; nope "$name checksum mismatch"; }
   $SUDO unzip -o "$tmp" -d /usr/local/bin/
   $SUDO chmod +x "/usr/local/bin/${name}"
   $SUDO mv "/usr/local/bin/${name}" "/usr/local/bin/${name}-${ver}"
   $SUDO ln -sfn "/usr/local/bin/${name}-${ver}" "/usr/local/bin/${name}"
   rm -f "$tmp" "$sums" "${sums}.sig"
+  rm -rf "$GNUPGHOME"
 }
 
 # Arch detect
