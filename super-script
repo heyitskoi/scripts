@@ -28,17 +28,18 @@ VERSION_FILE="${VERSION_FILE:-$SCRIPT_DIR/versions.env}"
 # shellcheck source=/dev/null
 [ -f "$VERSION_FILE" ] && . "$VERSION_FILE"
 
-: "${TERRAFORM_VERSION:?TERRAFORM_VERSION not set}"
-: "${PACKER_VERSION:?PACKER_VERSION not set}"
-: "${TRIVY_VERSION:?TRIVY_VERSION not set}"
-: "${PROMETHEUS_VERSION:?PROMETHEUS_VERSION not set}"
-: "${ALERTMANAGER_VERSION:?ALERTMANAGER_VERSION not set}"
-: "${GRAFANA_VERSION:?GRAFANA_VERSION not set}"
-: "${LOKI_VERSION:?LOKI_VERSION not set}"
-: "${PROMTAIL_VERSION:?PROMTAIL_VERSION not set}"
-: "${PORTAINER_VERSION:?PORTAINER_VERSION not set}"
-: "${REGISTRY_VERSION:?REGISTRY_VERSION not set}"
-: "${UPTIME_KUMA_VERSION:?UPTIME_KUMA_VERSION not set}"
+# Provide sane defaults; environment or versions file can override
+TERRAFORM_VERSION="${TERRAFORM_VERSION:-1.9.5}"
+PACKER_VERSION="${PACKER_VERSION:-1.11.2}"
+TRIVY_VERSION="${TRIVY_VERSION:-0.54.1}"
+PROMETHEUS_VERSION="${PROMETHEUS_VERSION:-v2.55.0}"
+ALERTMANAGER_VERSION="${ALERTMANAGER_VERSION:-v0.27.0}"
+GRAFANA_VERSION="${GRAFANA_VERSION:-10.4.6}"
+LOKI_VERSION="${LOKI_VERSION:-2.9.8}"
+PROMTAIL_VERSION="${PROMTAIL_VERSION:-2.9.8}"
+PORTAINER_VERSION="${PORTAINER_VERSION:-2.21.4}"
+REGISTRY_VERSION="${REGISTRY_VERSION:-2}"
+UPTIME_KUMA_VERSION="${UPTIME_KUMA_VERSION:-1}"
 
 # ------------------------------------------------------------
 # Sanity checks
@@ -91,7 +92,7 @@ install_docker(){
 }
 install_docker
 
-ME="${SUDO_USER:-$USER}"
+ME="${OPS_OWNER:-${SUDO_USER:-${LOGNAME:-$USER}}}"
 $SUDO usermod -aG docker "$ME" || true
 
 # ------------------------------------------------------------
@@ -148,10 +149,6 @@ case "$ARCH" in
   armv7l) ARCH=arm ;;
   *) say "Unknown arch $ARCH; URLs may need adjusting." ;;
 esac
-# Versions (env overrides supported)
-TERRAFORM_VERSION="${TERRAFORM_VERSION:-1.9.5}"
-PACKER_VERSION="${PACKER_VERSION:-1.11.2}"
-TRIVY_VERSION="${TRIVY_VERSION:-0.54.1}"
 
 # Terraform
 tf_url="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip"
@@ -165,11 +162,16 @@ packer_sha="$(curl -fsSL "https://releases.hashicorp.com/packer/${PACKER_VERSION
   | grep "packer_${PACKER_VERSION}_linux_${ARCH}.zip" | awk '{print $1}')"
 install_zip_bin packer "$PACKER_VERSION" "$packer_url" "$packer_sha"
 
-# Trivy (only amd64 in this prebuilt URL)
+# Trivy (prebuilt for amd64 and arm64)
 if [ "$ARCH" = "amd64" ]; then
   trivy_url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
   trivy_sha="$(curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt" \
     | grep "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" | awk '{print $1}')"
+  install_tgz_bin trivy "$trivy_url" "$trivy_sha" || true
+elif [ "$ARCH" = "arm64" ]; then
+  trivy_url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz"
+  trivy_sha="$(curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt" \
+    | grep "trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz" | awk '{print $1}')"
   install_tgz_bin trivy "$trivy_url" "$trivy_sha" || true
 else
   say "Skipping trivy prebuilt for ARCH=$ARCH; install manually later."
@@ -420,7 +422,6 @@ cat > site.yml <<'YAML'
         - "9093"  # Alertmanager
         - "3100"  # Loki
         - "9000"  # Portainer
-        - "5000"  # Registry
         - "3001"  # Uptime Kuma
       notify: enable ufw
 
@@ -661,7 +662,7 @@ cat > site.yml <<'YAML'
                 REGISTRY_STORAGE_DELETE_ENABLED: "true"
               volumes:
                 - registry:/var/lib/registry
-              ports: ["5000:5000"]
+              ports: ["127.0.0.1:5000:5000"]
               restart: unless-stopped
             uptime-kuma:
               image: louislam/uptime-kuma:__UPTIME_KUMA_VERSION__
@@ -728,6 +729,7 @@ cat > site.yml <<'YAML'
           [Service]
           Type=oneshot
           RemainAfterExit=yes
+          Restart=on-failure
           WorkingDirectory=/srv/ops/compose
           ExecStart=/usr/bin/docker compose -f /srv/ops/compose/ops.yml up -d
           ExecStop=/usr/bin/docker compose -f /srv/ops/compose/ops.yml down
@@ -788,7 +790,7 @@ docker compose -f ops.yml ps || fail=1
 probe(){ # name url
   local name="$1" url="$2" retries=3 i
   for i in $(seq "$retries"); do
-    if curl -fsS "$url" >/dev/null 2>&1; then
+    if curl -fsS --connect-timeout 5 --max-time 10 "$url" >/dev/null 2>&1; then
       say "$name responding at $url"
       return 0
     fi
@@ -813,6 +815,10 @@ fi
 # ------------------------------------------------------------
 # Exit banner
 # ------------------------------------------------------------
+if grep -q 'grafana_admin_password: "changeme"' /srv/ops/ansible/group_vars/all.yml 2>/dev/null; then
+  say "WARNING: Grafana admin password is still 'changeme'; update /srv/ops/ansible/group_vars/all.yml"
+fi
+
 IP_NOW=$(hostname -I | awk '{print $1}')
 say "Done. If you were added to the docker group, log out/in. URLs:"
 say " Grafana       : http://$IP_NOW:3000 (admin / see group_vars/all.yml: grafana_admin_password)"
@@ -820,6 +826,6 @@ say " Prometheus    : http://$IP_NOW:9090"
 say " Alertmanager  : http://$IP_NOW:9093"
 say " Loki (API)    : http://$IP_NOW:3100"
 say " Portainer     : http://$IP_NOW:9000"
-say " Registry      : http://$IP_NOW:5000 (use docker login)"
+say " Registry      : http://localhost:5000 (use docker login)"
 say " Uptime Kuma   : http://$IP_NOW:3001"
 say " Log file      : $LOG_FILE"
