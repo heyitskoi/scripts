@@ -1,0 +1,4 @@
+/srv/ops/ansible/group_vars/all.yml
+/srv/ops/config/secrets/
+/srv/ops/compose/ops.yml
+

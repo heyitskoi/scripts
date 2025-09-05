@@ -77,6 +77,8 @@ say "Ops owner user: ${ME}"
 if [ -n "$SUDO" ] && ! sudo -n true 2>/dev/null; then
   nope "Passwordless sudo required for non-root runs. Configure NOPASSWD or run the script with sudo."
 fi
+# Ensure systemd is PID 1
+[ -d /run/systemd/system ] || nope "systemd is required (PID 1)."
 # Source OS info; assumes systemd as PID 1
 . /etc/os-release || nope "Unknown OS."
 if [[ ! "${ID}" =~ (ubuntu|debian) ]] && [[ ! "${ID_LIKE:-}" =~ (ubuntu|debian) ]]; then
@@ -309,6 +311,12 @@ crowdsec_log_files:
 
 grafana_admin_password: "changeme"  # auto-generated if unset (use Ansible Vault to override)
 portainer_admin_password_hash: ""   # bcrypt hash; auto-generated if empty
+grafana_digest: ""          # e.g., sha256:abc...
+prometheus_digest: ""
+alertmanager_digest: ""
+loki_digest: ""
+promtail_digest: ""
+portainer_digest: ""
 
 # Multinode-curious knobs (safe defaults for single host)
 prom_host: "localhost"
@@ -634,6 +642,14 @@ cat > site.yml <<'YAML'
         - "22"    # SSH
       notify: enable ufw
 
+    - name: Allow ops stack ports when not on loopback
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+      loop: ["3000","9090","9093","3100","9000","3001"]
+      when: ops_listen_ip not in ['127.0.0.1','::1']
+      notify: enable ufw
+
     - name: Allow node exporter from Docker bridge
       ufw: { rule: allow, port: "9100", src: "172.17.0.0/16" }
 
@@ -879,9 +895,16 @@ cat > site.yml <<'YAML'
         mode: "0600"
         content: "{{ portainer_admin_password_hash }}"
 
+    - name: Save Portainer admin password once
+      copy:
+        dest: /srv/ops/config/secrets/PORTAINER_ADMIN_PASSWORD.once
+        mode: "0600"
+        content: "{{ portainer_pw_plain.stdout }}"
+      when: portainer_pw_plain is defined and (not ansible_check_mode|default(false))
+
     - name: Display Portainer admin password
       debug:
-        msg: "Portainer admin password (store securely): {{ portainer_pw_plain.stdout }}"
+        msg: "Portainer admin password stored in /srv/ops/config/secrets/PORTAINER_ADMIN_PASSWORD.once (delete after reading): {{ portainer_pw_plain.stdout }}"
       when: portainer_pw_plain is defined and (not ansible_check_mode|default(false))
 
     - name: Compose file for ops stack
@@ -893,7 +916,7 @@ cat > site.yml <<'YAML'
             # For internet exposure: put behind a reverse proxy (Traefik/Nginx) with TLS.
             # These ports are LAN-facing convenience only.
             prometheus:
-              image: prom/prometheus:__PROMETHEUS_VERSION__
+              image: "{{ 'prom/prometheus@' ~ prometheus_digest if prometheus_digest|length > 0 else 'prom/prometheus:__PROMETHEUS_VERSION__' }}"
               command: ["--config.file=/etc/prometheus/prometheus.yml","--web.enable-lifecycle","--web.route-prefix=/","--storage.tsdb.retention.time=15d","--storage.tsdb.retention.size=8GB"]
               volumes:
                 - /srv/ops/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -909,7 +932,7 @@ cat > site.yml <<'YAML'
                 timeout: 3s
                 retries: 10
             alertmanager:
-              image: prom/alertmanager:__ALERTMANAGER_VERSION__
+              image: "{{ 'prom/alertmanager@' ~ alertmanager_digest if alertmanager_digest|length > 0 else 'prom/alertmanager:__ALERTMANAGER_VERSION__' }}"
               volumes:
                 - /srv/ops/config/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
               ports: ["{{ ops_listen_ip }}:9093:9093"]
@@ -920,7 +943,7 @@ cat > site.yml <<'YAML'
                 timeout: 3s
                 retries: 10
             grafana:
-              image: grafana/grafana:__GRAFANA_VERSION__
+              image: "{{ 'grafana/grafana@' ~ grafana_digest if grafana_digest|length > 0 else 'grafana/grafana:__GRAFANA_VERSION__' }}"
               environment:
                 - GF_SECURITY_ADMIN_USER=admin
                 - GF_SECURITY_ADMIN_PASSWORD__FILE=/run/secrets/grafana_admin
@@ -937,7 +960,7 @@ cat > site.yml <<'YAML'
                 timeout: 3s
                 retries: 10
             loki:
-              image: grafana/loki:__LOKI_VERSION__
+              image: "{{ 'grafana/loki@' ~ loki_digest if loki_digest|length > 0 else 'grafana/loki:__LOKI_VERSION__' }}"
               command: ["-config.file=/etc/loki/loki-config.yml"]
               volumes:
                 - /srv/ops/config/loki-config.yml:/etc/loki/loki-config.yml:ro
@@ -950,10 +973,11 @@ cat > site.yml <<'YAML'
                 timeout: 3s
                 retries: 10
             promtail:
-              image: grafana/promtail:__PROMTAIL_VERSION__
+              image: "{{ 'grafana/promtail@' ~ promtail_digest if promtail_digest|length > 0 else 'grafana/promtail:__PROMTAIL_VERSION__' }}"
               command: ["-config.file=/etc/promtail/config.yml"]
               volumes:
                 - /srv/ops/config/promtail-config.yml:/etc/promtail/config.yml:ro
+                - /var/log/journal:/var/log/journal:ro
                 - /var/log:/var/log:ro
                 - /var/lib/promtail:/var/lib/promtail
               restart: unless-stopped
@@ -963,7 +987,7 @@ cat > site.yml <<'YAML'
                 timeout: 3s
                 retries: 10
             portainer:
-              image: portainer/portainer-ce:__PORTAINER_VERSION__
+              image: "{{ 'portainer/portainer-ce@' ~ portainer_digest if portainer_digest|length > 0 else 'portainer/portainer-ce:__PORTAINER_VERSION__' }}"
               volumes:
                 - /var/run/docker.sock:/var/run/docker.sock
                 - portainer:/data
@@ -1078,14 +1102,19 @@ cat > site.yml <<'YAML'
         content: |
           [Unit]
           Description=Ops Compose Stack
-          After=docker.service
+          After=docker.service network-online.target
           Requires=docker.service
+          Wants=network-online.target
           [Service]
           Type=oneshot
           RemainAfterExit=yes
           WorkingDirectory=/srv/ops/compose
-          ExecStart=/usr/bin/docker compose -f /srv/ops/compose/ops.yml up -d
+          ExecStart=/usr/bin/docker compose -f /srv/ops/compose/ops.yml up -d --wait
           ExecStop=/usr/bin/docker compose -f /srv/ops/compose/ops.yml down
+          TimeoutStartSec=0
+          ProtectSystem=full
+          ProtectHome=true
+          PrivateTmp=true
           [Install]
           WantedBy=multi-user.target
       notify: reload systemd
