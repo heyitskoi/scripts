@@ -7,6 +7,7 @@
 # ============================================================================
 
 set -euo pipefail
+trap 'nope "Failed at line $LINENO. See $LOG_FILE for details."' ERR
 IFS=$'\n\t'
 LOG_FILE=/var/log/supersetup.log # standard location for easy rotation
 
@@ -45,6 +46,11 @@ UPTIME_KUMA_VERSION="${UPTIME_KUMA_VERSION:-1}"
 # Sanity checks
 # ------------------------------------------------------------
 [ "$(id -u)" -eq 0 ] && SUDO="" || SUDO="sudo"
+ME="${OPS_OWNER:-${SUDO_USER:-${LOGNAME:-$USER}}}"
+say "Ops owner user: ${ME}"
+if [ -n "$SUDO" ] && ! sudo -n true 2>/dev/null; then
+  nope "Passwordless sudo required for non-root runs. Configure NOPASSWD or run the script with sudo."
+fi
 $SUDO touch "$LOG_FILE"
 $SUDO chown root:root "$LOG_FILE"
 $SUDO chmod 0644 "$LOG_FILE"
@@ -92,7 +98,6 @@ install_docker(){
 }
 install_docker
 
-ME="${OPS_OWNER:-${SUDO_USER:-${LOGNAME:-$USER}}}"
 $SUDO usermod -aG docker "$ME" || true
 
 # ------------------------------------------------------------
@@ -259,8 +264,10 @@ receivers:
       - api_url: "{{ slack_webhook_url }}"
         send_resolved: true
         channel: "#alerts"
-        title: "{{ '{{' }} .CommonAnnotations.summary {{ '}}' }}"
-        text: "{{ '{{' }} range .Alerts {{ '}}' }}*{{ '{{' }} .Annotations.summary {{ '}}' }}* on {{ '{{' }} .Labels.instance {{ '}}' }}{{ '{{' }} end {{ '}}' }}"
+        title: |
+          {{ '{{' }} .CommonAnnotations.summary {{ '}}' }}
+        text: |
+          {{ '{{' }} range .Alerts {{ '}}' }}*{{ '{{' }} .Annotations.summary {{ '}}' }}* on {{ '{{' }} .Labels.instance {{ '}}' }}{{ '{{' }} end {{ '}}' }}
 {% endif %}
 J2
 
@@ -345,6 +352,8 @@ cat > site.yml <<'YAML'
   pre_tasks:
     - name: Gather facts
       setup:
+    - name: Collect service facts
+      service_facts:
 
   tasks:
     - name: Create ops directories
@@ -385,7 +394,9 @@ cat > site.yml <<'YAML'
         backup: yes
 
     - name: Reload SSH
-      service: { name: ssh, state: reloaded }
+      service:
+        name: "{{ 'sshd' if ('sshd.service' in ansible_facts.services) else 'ssh' }}"
+        state: reloaded
 
     - name: Signer helper
       copy:
@@ -406,10 +417,16 @@ cat > site.yml <<'YAML'
         rule: allow
         port: "22"
 
-    - name: Set UFW defaults (deny inbound, allow outbound) but don't enable yet
+    - name: Set UFW default incoming policy to deny
       ufw:
         state: disabled
+        direction: incoming
         policy: deny
+    - name: Set UFW default outgoing policy to allow
+      ufw:
+        state: disabled
+        direction: outgoing
+        policy: allow
 
     - name: Allow required ports
       ufw:
@@ -450,6 +467,11 @@ cat > site.yml <<'YAML'
         state: present
         update_cache: yes
       when: enable_wireguard
+
+    - name: Validate WireGuard key placeholder
+      fail:
+        msg: "Set a real wireguard_private_key in group_vars/all.yml"
+      when: enable_wireguard and (wireguard_private_key is match('^<changeme>'))
 
     - name: WireGuard config
       template:
@@ -729,7 +751,6 @@ cat > site.yml <<'YAML'
           [Service]
           Type=oneshot
           RemainAfterExit=yes
-          Restart=on-failure
           WorkingDirectory=/srv/ops/compose
           ExecStart=/usr/bin/docker compose -f /srv/ops/compose/ops.yml up -d
           ExecStop=/usr/bin/docker compose -f /srv/ops/compose/ops.yml down
