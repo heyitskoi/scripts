@@ -8,14 +8,45 @@
 
 set -euo pipefail
 IFS=$'\n\t'
+LOG_FILE=/var/log/supersetup.log # standard location for easy rotation
 
-say(){ printf "\033[1;32m[+]\033[0m %s\n" "$*"; }
-nope(){ printf "\033[1;31m[!]\033[0m %s\n" "$*" >&2; exit 1; }
+say(){
+  printf "\033[1;32m[+]\033[0m %s\n" "$*"
+  printf "[+] %s\n" "$*" | ${SUDO:-} tee -a "$LOG_FILE" >/dev/null
+}
+nope(){
+  printf "\033[1;31m[!]\033[0m %s\n" "$*" >&2
+  printf "[!] %s\n" "$*" | ${SUDO:-} tee -a "$LOG_FILE" >/dev/null
+  exit 1
+}
+
+# ------------------------------------------------------------
+# Version variables (override via environment or versions file)
+# ------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION_FILE="${VERSION_FILE:-$SCRIPT_DIR/versions.env}"
+# shellcheck source=/dev/null
+[ -f "$VERSION_FILE" ] && . "$VERSION_FILE"
+
+: "${TERRAFORM_VERSION:?TERRAFORM_VERSION not set}"
+: "${PACKER_VERSION:?PACKER_VERSION not set}"
+: "${TRIVY_VERSION:?TRIVY_VERSION not set}"
+: "${PROMETHEUS_VERSION:?PROMETHEUS_VERSION not set}"
+: "${ALERTMANAGER_VERSION:?ALERTMANAGER_VERSION not set}"
+: "${GRAFANA_VERSION:?GRAFANA_VERSION not set}"
+: "${LOKI_VERSION:?LOKI_VERSION not set}"
+: "${PROMTAIL_VERSION:?PROMTAIL_VERSION not set}"
+: "${PORTAINER_VERSION:?PORTAINER_VERSION not set}"
+: "${REGISTRY_VERSION:?REGISTRY_VERSION not set}"
+: "${UPTIME_KUMA_VERSION:?UPTIME_KUMA_VERSION not set}"
 
 # ------------------------------------------------------------
 # Sanity checks
 # ------------------------------------------------------------
 [ "$(id -u)" -eq 0 ] && SUDO="" || SUDO="sudo"
+$SUDO touch "$LOG_FILE"
+$SUDO chown root:root "$LOG_FILE"
+$SUDO chmod 0644 "$LOG_FILE"
 . /etc/os-release || nope "Unknown OS."
 if [[ ! "${ID}" =~ (ubuntu|debian) ]] && [[ ! "${ID_LIKE:-}" =~ (ubuntu|debian) ]]; then
   nope "Use Ubuntu/Debian for this bootstrap."
@@ -117,22 +148,28 @@ case "$ARCH" in
   armv7l) ARCH=arm ;;
   *) say "Unknown arch $ARCH; URLs may need adjusting." ;;
 esac
+# Versions (env overrides supported)
+TERRAFORM_VERSION="${TERRAFORM_VERSION:-1.9.5}"
+PACKER_VERSION="${PACKER_VERSION:-1.11.2}"
+TRIVY_VERSION="${TRIVY_VERSION:-0.54.1}"
 
-tf_ver="1.9.5"
-tf_url="https://releases.hashicorp.com/terraform/${tf_ver}/terraform_${tf_ver}_linux_${ARCH}.zip"
-tf_sha=$(curl -fsSL "https://releases.hashicorp.com/terraform/${tf_ver}/terraform_${tf_ver}_SHA256SUMS" | grep "terraform_${tf_ver}_linux_${ARCH}.zip" | awk '{print $1}')
-install_zip_bin terraform "$tf_ver" "$tf_url" "$tf_sha"
+# Terraform
+tf_url="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip"
+tf_sha="$(curl -fsSL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_SHA256SUMS" \
+  | grep "terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip" | awk '{print $1}')"
+install_zip_bin terraform "$TERRAFORM_VERSION" "$tf_url" "$tf_sha"
 
-packer_ver="1.11.2"
-packer_url="https://releases.hashicorp.com/packer/${packer_ver}/packer_${packer_ver}_linux_${ARCH}.zip"
-packer_sha=$(curl -fsSL "https://releases.hashicorp.com/packer/${packer_ver}/packer_${packer_ver}_SHA256SUMS" | grep "packer_${packer_ver}_linux_${ARCH}.zip" | awk '{print $1}')
-install_zip_bin packer "$packer_ver" "$packer_url" "$packer_sha"
+# Packer
+packer_url="https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_${ARCH}.zip"
+packer_sha="$(curl -fsSL "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_SHA256SUMS" \
+  | grep "packer_${PACKER_VERSION}_linux_${ARCH}.zip" | awk '{print $1}')"
+install_zip_bin packer "$PACKER_VERSION" "$packer_url" "$packer_sha"
 
-# Trivy prebuilt is x86_64-only in this URL; skip gracefully on others
+# Trivy (only amd64 in this prebuilt URL)
 if [ "$ARCH" = "amd64" ]; then
-  trivy_ver="0.54.1"
-  trivy_url="https://github.com/aquasecurity/trivy/releases/download/v${trivy_ver}/trivy_${trivy_ver}_Linux-64bit.tar.gz"
-  trivy_sha=$(curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${trivy_ver}/trivy_${trivy_ver}_checksums.txt" | grep "trivy_${trivy_ver}_Linux-64bit.tar.gz" | awk '{print $1}')
+  trivy_url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+  trivy_sha="$(curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt" \
+    | grep "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" | awk '{print $1}')"
   install_tgz_bin trivy "$trivy_url" "$trivy_sha" || true
 else
   say "Skipping trivy prebuilt for ARCH=$ARCH; install manually later."
@@ -168,8 +205,18 @@ slack_webhook_url: ""           # set for Alertmanager
 telegram_bot_token: ""
 telegram_chat_id: ""
 
-enable_wireguard: false
-enable_crowdsec: false
+enable_wireguard: false     # Set to true to install WireGuard VPN
+enable_crowdsec: false      # Set to true to install CrowdSec IDS
+
+# WireGuard defaults (adjust to your environment)
+wireguard_address: "10.0.0.1/24"
+wireguard_listen_port: 51820
+wireguard_private_key: "<changeme>"
+wireguard_peers: []
+
+# CrowdSec log sources
+crowdsec_log_files:
+  - /var/log/auth.log
 
 grafana_admin_password: "changeme"  # change post-install or set here
 
@@ -259,7 +306,30 @@ sudo docker run -d --name promtail --restart unless-stopped \
   -v /var/log:/var/log:ro \
   -v /var/lib/promtail:/var/lib/promtail \
   -p 9080:9080 \
-  grafana/promtail:2.9.8 -config.file=/etc/promtail/config.yml
+  grafana/promtail:__PROMTAIL_VERSION__ -config.file=/etc/promtail/config.yml
+J2
+sed -i "s/__PROMTAIL_VERSION__/${PROMTAIL_VERSION}/g" templates/install-agents.sh.j2
+
+# WireGuard interface config
+cat > templates/wg0.conf.j2 <<'J2'
+[Interface]
+Address = {{ wireguard_address }}
+ListenPort = {{ wireguard_listen_port }}
+PrivateKey = {{ wireguard_private_key }}
+{% for peer in wireguard_peers %}
+[Peer]
+PublicKey = {{ peer.public_key }}
+AllowedIPs = {{ peer.allowed_ips }}
+{% if peer.endpoint is defined %}Endpoint = {{ peer.endpoint }}{% endif %}
+{% endfor %}
+J2
+
+# CrowdSec acquisition config
+cat > templates/crowdsec-acquis.yaml.j2 <<'J2'
+filenames:
+{% for file in crowdsec_log_files %}
+  - {{ file }}
+{% endfor %}
 J2
 
 # -------- site playbook --------
@@ -354,6 +424,13 @@ cat > site.yml <<'YAML'
         - "3001"  # Uptime Kuma
       notify: enable ufw
 
+    - name: Allow WireGuard port
+      ufw:
+        rule: allow
+        port: "{{ wireguard_listen_port }}"
+        proto: udp
+      when: enable_wireguard
+
     - name: Fail2ban config (basic ssh)
       copy:
         dest: /etc/fail2ban/jail.d/ssh.local
@@ -364,6 +441,55 @@ cat > site.yml <<'YAML'
           bantime = 1h
           findtime = 10m
       notify: restart fail2ban
+
+    # -------- Optional WireGuard VPN --------
+    - name: Install WireGuard
+      apt:
+        name: wireguard
+        state: present
+        update_cache: yes
+      when: enable_wireguard
+
+    - name: WireGuard config
+      template:
+        src: templates/wg0.conf.j2
+        dest: /etc/wireguard/wg0.conf
+        mode: "0600"
+      when: enable_wireguard
+      notify: restart wireguard
+
+    - name: Enable WireGuard service
+      systemd:
+        name: wg-quick@wg0
+        enabled: true
+        state: started
+      when: enable_wireguard
+
+    # -------- Optional CrowdSec IDS --------
+    - name: Install CrowdSec
+      apt:
+        name:
+          - crowdsec
+          - crowdsec-firewall-bouncer-iptables
+        state: present
+        update_cache: yes
+      when: enable_crowdsec
+
+    - name: CrowdSec acquisition config
+      template:
+        src: templates/crowdsec-acquis.yaml.j2
+        dest: /etc/crowdsec/acquis.yaml
+        mode: "0644"
+      when: enable_crowdsec
+      notify: restart crowdsec
+
+    - name: Ensure CrowdSec service
+      service: { name: crowdsec, state: started, enabled: true }
+      when: enable_crowdsec
+
+    - name: Ensure CrowdSec firewall bouncer
+      service: { name: crowdsec-firewall-bouncer, state: started, enabled: true }
+      when: enable_crowdsec
 
     # -------- Docker daemon.json --------
     - name: Configure Docker log rotation + BuildKit
@@ -481,7 +607,7 @@ cat > site.yml <<'YAML'
         content: |
           services:
             prometheus:
-              image: prom/prometheus:v2.55.0
+              image: prom/prometheus:__PROMETHEUS_VERSION__
               command: ["--config.file=/etc/prometheus/prometheus.yml","--web.enable-lifecycle","--web.route-prefix=/"]
               volumes:
                 - /srv/ops/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -492,13 +618,13 @@ cat > site.yml <<'YAML'
               ports: ["9090:9090"]
               restart: unless-stopped
             alertmanager:
-              image: prom/alertmanager:v0.27.0
+              image: prom/alertmanager:__ALERTMANAGER_VERSION__
               volumes:
                 - /srv/ops/config/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
               ports: ["9093:9093"]
               restart: unless-stopped
             grafana:
-              image: grafana/grafana:10.4.6
+              image: grafana/grafana:__GRAFANA_VERSION__
               environment:
                 - GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password }}
               volumes:
@@ -507,7 +633,7 @@ cat > site.yml <<'YAML'
               ports: ["3000:3000"]
               restart: unless-stopped
             loki:
-              image: grafana/loki:2.9.8
+              image: grafana/loki:__LOKI_VERSION__
               command: ["-config.file=/etc/loki/loki-config.yml"]
               volumes:
                 - /srv/ops/config/loki-config.yml:/etc/loki/loki-config.yml:ro
@@ -515,7 +641,7 @@ cat > site.yml <<'YAML'
               ports: ["3100:3100"]
               restart: unless-stopped
             promtail:
-              image: grafana/promtail:2.9.8
+              image: grafana/promtail:__PROMTAIL_VERSION__
               command: ["-config.file=/etc/promtail/config.yml"]
               volumes:
                 - /srv/ops/config/promtail-config.yml:/etc/promtail/config.yml:ro
@@ -523,14 +649,14 @@ cat > site.yml <<'YAML'
                 - /var/lib/promtail:/var/lib/promtail
               restart: unless-stopped
             portainer:
-              image: portainer/portainer-ce:2.21.4
+              image: portainer/portainer-ce:__PORTAINER_VERSION__
               volumes:
                 - /var/run/docker.sock:/var/run/docker.sock
                 - portainer:/data
               ports: ["9000:9000"]
               restart: unless-stopped
             registry:
-              image: registry:2
+              image: registry:__REGISTRY_VERSION__
               environment:
                 REGISTRY_STORAGE_DELETE_ENABLED: "true"
               volumes:
@@ -538,7 +664,7 @@ cat > site.yml <<'YAML'
               ports: ["5000:5000"]
               restart: unless-stopped
             uptime-kuma:
-              image: louislam/uptime-kuma:1
+              image: louislam/uptime-kuma:__UPTIME_KUMA_VERSION__
               volumes:
                 - uptimekuma:/app/data
               ports: ["3001:3001"]
@@ -622,18 +748,67 @@ cat > site.yml <<'YAML'
     - name: restart fail2ban
       service: { name: fail2ban, state: restarted, enabled: true }
 
+    - name: restart wireguard
+      service: { name: wg-quick@wg0, state: restarted }
+
+    - name: restart crowdsec
+      service: { name: crowdsec, state: restarted }
+
     - name: reload systemd
       systemd: { daemon_reload: true }
 
     - name: restart docker
       service: { name: docker, state: restarted }
 YAML
+sed -i \
+  -e "s/__PROMETHEUS_VERSION__/${PROMETHEUS_VERSION}/g" \
+  -e "s/__ALERTMANAGER_VERSION__/${ALERTMANAGER_VERSION}/g" \
+  -e "s/__GRAFANA_VERSION__/${GRAFANA_VERSION}/g" \
+  -e "s/__LOKI_VERSION__/${LOKI_VERSION}/g" \
+  -e "s/__PROMTAIL_VERSION__/${PROMTAIL_VERSION}/g" \
+  -e "s/__PORTAINER_VERSION__/${PORTAINER_VERSION}/g" \
+  -e "s/__REGISTRY_VERSION__/${REGISTRY_VERSION}/g" \
+  -e "s/__UPTIME_KUMA_VERSION__/${UPTIME_KUMA_VERSION}/g" \
+  site.yml
 
 # ------------------------------------------------------------
 # Run the playbook
 # ------------------------------------------------------------
 say "Running Ansible (local)…"
 ansible-playbook -i inventory.ini site.yml
+
+# ------------------------------------------------------------
+# Service health checks
+# ------------------------------------------------------------
+say "Checking services…"
+fail=0
+cd /srv/ops/compose
+docker compose -f ops.yml ps || fail=1
+
+probe(){ # name url
+  local name="$1" url="$2" retries=3 i
+  for i in $(seq "$retries"); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      say "$name responding at $url"
+      return 0
+    fi
+    sleep 3
+  done
+  say "$name FAILED at $url"
+  fail=1
+}
+
+probe "Grafana"      "http://localhost:3000/login"
+probe "Prometheus"   "http://localhost:9090/-/ready"
+probe "Alertmanager" "http://localhost:9093/-/ready"
+probe "Loki"         "http://localhost:3100/ready"
+probe "Portainer"    "http://localhost:9000"
+probe "Registry"     "http://localhost:5000/v2/"
+probe "Uptime Kuma"  "http://localhost:3001"
+
+if [ "$fail" -ne 0 ]; then
+  nope "Service checks failed. Use 'docker compose -f /srv/ops/compose/ops.yml ps' and inspect logs."
+fi
 
 # ------------------------------------------------------------
 # Exit banner
@@ -647,3 +822,4 @@ say " Loki (API)    : http://$IP_NOW:3100"
 say " Portainer     : http://$IP_NOW:9000"
 say " Registry      : http://$IP_NOW:5000 (use docker login)"
 say " Uptime Kuma   : http://$IP_NOW:3001"
+say " Log file      : $LOG_FILE"
