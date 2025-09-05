@@ -10,7 +10,7 @@ set -euo pipefail
 IFS=$'\n\t'
 [ "$(id -u)" -eq 0 ] && SUDO="" || SUDO="sudo"
 LOG_FILE=/var/log/supersetup.log # standard location for easy rotation
-$SUDO touch "$LOG_FILE" && $SUDO chmod 0644 "$LOG_FILE" && $SUDO chown root:root "$LOG_FILE"
+$SUDO touch "$LOG_FILE" && $SUDO chmod 0600 "$LOG_FILE" && $SUDO chown root:root "$LOG_FILE"
 ME="${OPS_OWNER:-${SUDO_USER:-${LOGNAME:-$USER}}}"
 
 say(){
@@ -91,6 +91,10 @@ apt_retry install -y --no-install-recommends \
   ca-certificates gnupg lsb-release curl git unzip tar make jq \
   ufw fail2ban python3 python3-pip nmap
 
+# Import HashiCorp release key for signature verification
+$SUDO install -m0755 -d /usr/share/keyrings
+curl -fsSL https://apt.releases.hashicorp.com/gpg | $SUDO gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+
 # ------------------------------------------------------------
 # Docker CE (official repo)
 # ------------------------------------------------------------
@@ -150,6 +154,28 @@ install_zip_bin(){ # name ver url sha256
   rm -f "$tmp"
 }
 
+install_zip_bin_gpg(){ # name ver url sig_url keyring
+  local name="$1" ver="$2" url="$3" sig_url="$4" keyring="$5"
+  if command -v "$name" >/dev/null 2>&1 && "$name" version 2>/dev/null | grep -q "$ver"; then
+    return 0
+  fi
+  say "Installing $name $ver…"
+  local tmp tmp_sig
+  tmp=$(mktemp "/tmp/${name}.XXXXXX.zip")
+  tmp_sig="$tmp.sig"
+  curl -fsSL -o "$tmp" "$url"
+  curl -fsSL -o "$tmp_sig" "$sig_url"
+  if ! gpg --keyring "$keyring" --verify "$tmp_sig" "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp" "$tmp_sig"
+    nope "$name signature verification failed"
+  fi
+  $SUDO unzip -o "$tmp" -d /usr/local/bin/
+  $SUDO chmod +x "/usr/local/bin/${name}"
+  $SUDO mv "/usr/local/bin/${name}" "/usr/local/bin/${name}-${ver}"
+  $SUDO ln -sfn "/usr/local/bin/${name}-${ver}" "/usr/local/bin/${name}"
+  rm -f "$tmp" "$tmp_sig"
+}
+
 install_tgz_bin(){ # name ver url sha256
   local name="$1" ver="$2" url="$3" sha="$4"
   if command -v "$name" >/dev/null 2>&1 && "$name" version 2>/dev/null | grep -q "$ver"; then
@@ -189,15 +215,13 @@ esac
 
 # Terraform
 tf_url="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip"
-tf_sha="$(curl -fsSL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_SHA256SUMS" \
-  | grep "terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip" | awk '{print $1}')"
-install_zip_bin terraform "$TERRAFORM_VERSION" "$tf_url" "$tf_sha"
+tf_sig="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip.sig"
+install_zip_bin_gpg terraform "$TERRAFORM_VERSION" "$tf_url" "$tf_sig" "/usr/share/keyrings/hashicorp.gpg"
 
 # Packer
 packer_url="https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_${ARCH}.zip"
-packer_sha="$(curl -fsSL "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_SHA256SUMS" \
-  | grep "packer_${PACKER_VERSION}_linux_${ARCH}.zip" | awk '{print $1}')"
-install_zip_bin packer "$PACKER_VERSION" "$packer_url" "$packer_sha"
+packer_sig="https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_${ARCH}.zip.sig"
+install_zip_bin_gpg packer "$PACKER_VERSION" "$packer_url" "$packer_sig" "/usr/share/keyrings/hashicorp.gpg"
 
 # Trivy (prebuilt for amd64 and arm64)
 if [ "$ARCH" = "amd64" ]; then
@@ -258,7 +282,7 @@ wireguard_peers: []
 crowdsec_log_files:
   - /var/log/auth.log
 
-grafana_admin_password: "changeme"  # change post-install or set here
+grafana_admin_password: "changeme"  # change post-install or set here (use Ansible Vault)
 
 # Multinode-curious knobs (safe defaults for single host)
 prom_host: "localhost"
@@ -270,8 +294,8 @@ prometheus_url: "http://{{ prom_host }}:9090"
 loki_url_container: "http://loki:3100"        # for Docker services talking to Loki
 loki_url_agents: "http://{{ ansible_default_ipv4.address }}:3100"  # for remote hosts
 
-# Prometheus targets (expand as you onboard servers)
-prom_targets: []  # Add more targets like "10.0.0.12:9100", "web-1:9100" etc. The local host is auto-added.
+# Prometheus targets
+prom_targets: []  # leave empty; the playbook already auto-adds this host’s :9100
 YAML
 
 # -------- templates --------
@@ -293,7 +317,13 @@ J2
 # Alertmanager (Slack optional)
 cat > templates/alertmanager.yml.j2 <<'J2'
 route:
-  receiver: {{ 'slack' if slack_webhook_url|length > 0 else 'default' }}
+  receiver: default
+{% if slack_webhook_url|length > 0 %}
+  routes:
+    - matchers: []
+      receiver: slack
+      continue: false
+{% endif %}
   group_by: ['alertname']
   group_wait: 30s
   repeat_interval: 3h
@@ -327,6 +357,11 @@ scrape_configs:
         labels:
           job: varlogs
           __path__: /var/log/**/*.log
+  - job_name: journal
+    journal:
+      path: /var/log/journal
+      labels:
+        job: systemd-journal
 J2
 
 # Agent installer (for remote hosts)
@@ -673,6 +708,18 @@ cat > site.yml <<'YAML'
               access: proxy
               url: http://loki:3100
 
+    - name: Secrets dir
+      file:
+        path: /srv/ops/config/secrets
+        state: directory
+        mode: "0700"
+
+    - name: Grafana admin password secret
+      copy:
+        dest: /srv/ops/config/secrets/grafana_admin
+        mode: "0600"
+        content: "{{ grafana_admin_password }}"
+
     - name: Compose file for ops stack
       copy:
         dest: /srv/ops/compose/ops.yml
@@ -692,22 +739,39 @@ cat > site.yml <<'YAML'
                 # - /srv/ops/data/prometheus:/prometheus
               ports: ["9090:9090"]
               restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9090/-/ready"]
+                interval: 10s
+                timeout: 3s
+                retries: 10
             alertmanager:
               image: prom/alertmanager:__ALERTMANAGER_VERSION__
               volumes:
                 - /srv/ops/config/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
               ports: ["9093:9093"]
               restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9093/-/ready"]
+                interval: 10s
+                timeout: 3s
+                retries: 10
             grafana:
               image: grafana/grafana:__GRAFANA_VERSION__
               environment:
                 - GF_SECURITY_ADMIN_USER=admin
-                - GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password }}
+                - GF_SECURITY_ADMIN_PASSWORD__FILE=/run/secrets/grafana_admin
+              secrets:
+                - grafana_admin
               volumes:
                 - grafana:/var/lib/grafana
                 - /srv/ops/config/grafana/provisioning:/etc/grafana/provisioning:ro
               ports: ["3000:3000"]
               restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3000/api/health"]
+                interval: 10s
+                timeout: 3s
+                retries: 10
             loki:
               image: grafana/loki:__LOKI_VERSION__
               command: ["-config.file=/etc/loki/loki-config.yml"]
@@ -716,6 +780,11 @@ cat > site.yml <<'YAML'
                 - loki:/loki
               ports: ["3100:3100"]
               restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3100/ready"]
+                interval: 10s
+                timeout: 3s
+                retries: 10
             promtail:
               image: grafana/promtail:__PROMTAIL_VERSION__
               command: ["-config.file=/etc/promtail/config.yml"]
@@ -724,6 +793,11 @@ cat > site.yml <<'YAML'
                 - /var/log:/var/log:ro
                 - /var/lib/promtail:/var/lib/promtail
               restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9080/ready"]
+                interval: 10s
+                timeout: 3s
+                retries: 10
             portainer:
               image: portainer/portainer-ce:__PORTAINER_VERSION__
               volumes:
@@ -731,6 +805,12 @@ cat > site.yml <<'YAML'
                 - portainer:/data
               ports: ["9000:9000"]
               restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9000/api/status"]
+                interval: 10s
+                timeout: 3s
+                retries: 10
+            # Local development registry; no auth/TLS. Do not expose beyond localhost.
             registry:
               image: registry:__REGISTRY_VERSION__
               environment:
@@ -739,12 +819,22 @@ cat > site.yml <<'YAML'
                 - registry:/var/lib/registry
               ports: ["127.0.0.1:5000:5000"]  # bound to loopback; do not expose
               restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:5000/v2/"]
+                interval: 10s
+                timeout: 3s
+                retries: 10
             uptime-kuma:
               image: louislam/uptime-kuma:__UPTIME_KUMA_VERSION__
               volumes:
                 - uptimekuma:/app/data
               ports: ["3001:3001"]
               restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3001/"]
+                interval: 10s
+                timeout: 3s
+                retries: 10
           volumes:
             prometheus: {}
             grafana: {}
@@ -752,6 +842,9 @@ cat > site.yml <<'YAML'
             portainer: {}
             registry: {}
             uptimekuma: {}
+          secrets:
+            grafana_admin:
+              file: /srv/ops/config/secrets/grafana_admin
 
     - name: Installer: add-trust-ca.sh (trust SSH CA on targets)
       copy:
