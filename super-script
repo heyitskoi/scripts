@@ -136,8 +136,18 @@ slack_webhook_url: ""           # set for Alertmanager
 telegram_bot_token: ""
 telegram_chat_id: ""
 
-enable_wireguard: false
-enable_crowdsec: false
+enable_wireguard: false     # Set to true to install WireGuard VPN
+enable_crowdsec: false      # Set to true to install CrowdSec IDS
+
+# WireGuard defaults (adjust to your environment)
+wireguard_address: "10.0.0.1/24"
+wireguard_listen_port: 51820
+wireguard_private_key: "<changeme>"
+wireguard_peers: []
+
+# CrowdSec log sources
+crowdsec_log_files:
+  - /var/log/auth.log
 
 grafana_admin_password: "changeme"  # change post-install or set here
 
@@ -228,6 +238,28 @@ sudo docker run -d --name promtail --restart unless-stopped \
   -v /var/lib/promtail:/var/lib/promtail \
   -p 9080:9080 \
   grafana/promtail:2.9.8 -config.file=/etc/promtail/config.yml
+J2
+
+# WireGuard interface config
+cat > templates/wg0.conf.j2 <<'J2'
+[Interface]
+Address = {{ wireguard_address }}
+ListenPort = {{ wireguard_listen_port }}
+PrivateKey = {{ wireguard_private_key }}
+{% for peer in wireguard_peers %}
+[Peer]
+PublicKey = {{ peer.public_key }}
+AllowedIPs = {{ peer.allowed_ips }}
+{% if peer.endpoint is defined %}Endpoint = {{ peer.endpoint }}{% endif %}
+{% endfor %}
+J2
+
+# CrowdSec acquisition config
+cat > templates/crowdsec-acquis.yaml.j2 <<'J2'
+filenames:
+{% for file in crowdsec_log_files %}
+  - {{ file }}
+{% endfor %}
 J2
 
 # -------- site playbook --------
@@ -322,6 +354,13 @@ cat > site.yml <<'YAML'
         - "3001"  # Uptime Kuma
       notify: enable ufw
 
+    - name: Allow WireGuard port
+      ufw:
+        rule: allow
+        port: "{{ wireguard_listen_port }}"
+        proto: udp
+      when: enable_wireguard
+
     - name: Fail2ban config (basic ssh)
       copy:
         dest: /etc/fail2ban/jail.d/ssh.local
@@ -332,6 +371,55 @@ cat > site.yml <<'YAML'
           bantime = 1h
           findtime = 10m
       notify: restart fail2ban
+
+    # -------- Optional WireGuard VPN --------
+    - name: Install WireGuard
+      apt:
+        name: wireguard
+        state: present
+        update_cache: yes
+      when: enable_wireguard
+
+    - name: WireGuard config
+      template:
+        src: templates/wg0.conf.j2
+        dest: /etc/wireguard/wg0.conf
+        mode: "0600"
+      when: enable_wireguard
+      notify: restart wireguard
+
+    - name: Enable WireGuard service
+      systemd:
+        name: wg-quick@wg0
+        enabled: true
+        state: started
+      when: enable_wireguard
+
+    # -------- Optional CrowdSec IDS --------
+    - name: Install CrowdSec
+      apt:
+        name:
+          - crowdsec
+          - crowdsec-firewall-bouncer-iptables
+        state: present
+        update_cache: yes
+      when: enable_crowdsec
+
+    - name: CrowdSec acquisition config
+      template:
+        src: templates/crowdsec-acquis.yaml.j2
+        dest: /etc/crowdsec/acquis.yaml
+        mode: "0644"
+      when: enable_crowdsec
+      notify: restart crowdsec
+
+    - name: Ensure CrowdSec service
+      service: { name: crowdsec, state: started, enabled: true }
+      when: enable_crowdsec
+
+    - name: Ensure CrowdSec firewall bouncer
+      service: { name: crowdsec-firewall-bouncer, state: started, enabled: true }
+      when: enable_crowdsec
 
     # -------- Docker daemon.json --------
     - name: Configure Docker log rotation + BuildKit
@@ -589,6 +677,12 @@ cat > site.yml <<'YAML'
 
     - name: restart fail2ban
       service: { name: fail2ban, state: restarted, enabled: true }
+
+    - name: restart wireguard
+      service: { name: wg-quick@wg0, state: restarted }
+
+    - name: restart crowdsec
+      service: { name: crowdsec, state: restarted }
 
     - name: reload systemd
       systemd: { daemon_reload: true }
