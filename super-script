@@ -13,6 +13,9 @@ LOG_FILE=/var/log/supersetup.log # standard location for easy rotation
 $SUDO touch "$LOG_FILE" && $SUDO chmod 0600 "$LOG_FILE" && $SUDO chown root:root "$LOG_FILE"
 ME="${OPS_OWNER:-${SUDO_USER:-${LOGNAME:-$USER}}}"
 
+# Avoid interactive dpkg/apt prompts (e.g. tzdata)
+export DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-noninteractive}
+
 say(){
   printf "\033[1;32m[+]\033[0m %s\n" "$*"
   printf "[+] %s\n" "$*" | ${SUDO:-} tee -a "$LOG_FILE" >/dev/null
@@ -99,6 +102,8 @@ fi
 # ------------------------------------------------------------
 say "Updating packages…"
 apt_retry update
+# Optional but useful to keep the base system fresh without prompts
+apt_retry -o Dpkg::Options::="--force-confnew" -y dist-upgrade || true
 apt_retry install -y --no-install-recommends \
   ca-certificates gnupg lsb-release curl git unzip tar make jq \
   ufw fail2ban python3 python3-pip nmap
@@ -380,6 +385,7 @@ J2
 cat > templates/install-agents.sh.j2 <<'J2'
 #!/usr/bin/env bash
 set -euo pipefail
+export DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-noninteractive}
 if command -v apt-get >/dev/null; then
   apt_retry(){ # args: apt-get subcommand + options
     local n=0; until [ $n -ge 3 ]; do
@@ -391,6 +397,13 @@ if command -v apt-get >/dev/null; then
   }
   apt_retry update
   apt_retry install -y prometheus-node-exporter
+  sudo mkdir -p /etc/systemd/system/prometheus-node-exporter.service.d
+  cat <<'EOF' | sudo tee /etc/systemd/system/prometheus-node-exporter.service.d/override.conf >/dev/null
+[Service]
+ExecStart=
+ExecStart=/usr/bin/prometheus-node-exporter --web.listen-address=127.0.0.1:9100
+EOF
+  sudo systemctl daemon-reload
   sudo systemctl enable --now prometheus-node-exporter
 fi
 sudo mkdir -p /etc/promtail /var/lib/promtail
@@ -493,11 +506,18 @@ cat > site.yml <<'YAML'
         line: 'TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem'
         create: yes
         backup: yes
+      notify: reload ssh
 
-    - name: Reload SSH
-      service:
-        name: "{{ 'sshd' if ('sshd.service' in ansible_facts.services) else 'ssh' }}"
-        state: reloaded
+    - name: SSH hardening (no root pwd, sane auth)
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        create: yes
+        block: |
+          PasswordAuthentication no
+          PermitRootLogin prohibit-password
+          PubkeyAuthentication yes
+          ChallengeResponseAuthentication no
+      notify: reload ssh
 
     - name: Signer helper
       copy:
@@ -637,6 +657,18 @@ cat > site.yml <<'YAML'
         state: present
         update_cache: yes
 
+    - name: Bind node exporter to loopback
+      copy:
+        dest: /etc/systemd/system/prometheus-node-exporter.service.d/override.conf
+        mode: "0644"
+        content: |
+          [Service]
+          ExecStart=
+          ExecStart=/usr/bin/prometheus-node-exporter --web.listen-address=127.0.0.1:9100
+      notify:
+        - reload systemd
+        - restart node exporter
+
     - name: Enable node exporter service
       service: { name: prometheus-node-exporter, state: started, enabled: true }
 
@@ -749,7 +781,7 @@ cat > site.yml <<'YAML'
             # These ports are LAN-facing convenience only.
             prometheus:
               image: prom/prometheus:__PROMETHEUS_VERSION__
-              command: ["--config.file=/etc/prometheus/prometheus.yml","--web.enable-lifecycle","--web.route-prefix=/"]
+              command: ["--config.file=/etc/prometheus/prometheus.yml","--web.enable-lifecycle","--web.route-prefix=/","--storage.tsdb.retention.time=15d","--storage.tsdb.retention.size=8GB"]
               volumes:
                 - /srv/ops/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
                 - /srv/ops/config/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
@@ -960,6 +992,14 @@ cat > site.yml <<'YAML'
 
     - name: restart docker
       service: { name: docker, state: restarted }
+
+    - name: reload ssh
+      service:
+        name: "{{ 'sshd' if ('sshd.service' in ansible_facts.services) else 'ssh' }}"
+        state: reloaded
+
+    - name: restart node exporter
+      service: { name: prometheus-node-exporter, state: restarted, enabled: true }
 YAML
 sed -i \
   -e "s/__PROMETHEUS_VERSION__/${PROMETHEUS_VERSION}/g" \
