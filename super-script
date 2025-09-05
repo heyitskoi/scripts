@@ -77,6 +77,7 @@ say "Ops owner user: ${ME}"
 if [ -n "$SUDO" ] && ! sudo -n true 2>/dev/null; then
   nope "Passwordless sudo required for non-root runs. Configure NOPASSWD or run the script with sudo."
 fi
+# Source OS info; assumes systemd as PID 1
 . /etc/os-release || nope "Unknown OS."
 if [[ ! "${ID}" =~ (ubuntu|debian) ]] && [[ ! "${ID_LIKE:-}" =~ (ubuntu|debian) ]]; then
   nope "Use Ubuntu/Debian for this bootstrap."
@@ -108,7 +109,7 @@ apt_retry install -y --no-install-recommends \
   ca-certificates gnupg lsb-release curl git unzip tar make jq \
   ufw fail2ban python3 python3-pip nmap
 
-# Import HashiCorp release key for signature verification
+# Import HashiCorp release key for signature verification (also used for zip checks below)
 $SUDO install -m0755 -d /usr/share/keyrings
 curl -fsSL https://apt.releases.hashicorp.com/gpg | $SUDO gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
 
@@ -281,13 +282,14 @@ mkdir -p group_vars
 cat > group_vars/all.yml <<'YAML'
 # Optional front-door hostnames (for proxy/TLS later)
 ops_domain: ""  # e.g., ops.example.com
-ops_listen_ip: "0.0.0.0"        # change to your LAN IP to limit exposure
+ops_listen_ip: "127.0.0.1"      # change to your LAN/VPN IP to limit exposure
 slack_webhook_url: ""           # set for Alertmanager
 telegram_bot_token: ""
 telegram_chat_id: ""
 
 enable_wireguard: false     # Set to true to install WireGuard VPN
 enable_crowdsec: false      # Set to true to install CrowdSec IDS
+disable_ipv6: false         # Set true to disable IPv6 and enforce IPv4-only
 
 # WireGuard defaults (adjust to your environment)
 wireguard_address: "10.0.0.1/24"
@@ -299,7 +301,8 @@ wireguard_peers: []
 crowdsec_log_files:
   - /var/log/auth.log
 
-grafana_admin_password: "changeme"  # change post-install or set here (use Ansible Vault)
+grafana_admin_password: "changeme"  # auto-generated if unset (use Ansible Vault to override)
+portainer_admin_password_hash: ""   # bcrypt hash; auto-generated if empty
 
 # Multinode-curious knobs (safe defaults for single host)
 prom_host: "localhost"
@@ -329,6 +332,9 @@ scrape_configs:
   - job_name: 'nodes'
     static_configs:
       - targets: {{ ((prom_targets | default([])) + [ansible_default_ipv4.address ~ ':9100']) | unique | to_json }}
+  - job_name: 'grafana'
+    static_configs:
+      - targets: ['grafana:3000']
 J2
 
 # Alertmanager (Slack optional)
@@ -499,6 +505,24 @@ cat > site.yml <<'YAML'
         group: root
         mode: "0644"
 
+    - name: Ensure SSH revoked keys file exists
+      copy:
+        dest: /etc/ssh/revoked_keys
+        owner: root
+        group: root
+        mode: "0644"
+        content: ""
+        force: false
+
+    - name: Reference revoked keys in sshd
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^RevokedKeys'
+        line: 'RevokedKeys /etc/ssh/revoked_keys'
+        create: yes
+        backup: yes
+      notify: reload ssh
+
     - name: Enforce CA trust in sshd
       lineinfile:
         path: /etc/ssh/sshd_config
@@ -549,18 +573,30 @@ cat > site.yml <<'YAML'
         direction: outgoing
         policy: allow
 
+    - name: Disable IPv6 when requested
+      block:
+        - name: Disable IPv6 via sysctl
+          copy:
+            dest: /etc/sysctl.d/90-no-ipv6.conf
+            mode: "0644"
+            content: |
+              net.ipv6.conf.all.disable_ipv6=1
+              net.ipv6.conf.default.disable_ipv6=1
+        - name: Apply sysctl changes
+          command: sysctl --system
+        - name: UFW IPv4 only
+          lineinfile:
+            path: /etc/default/ufw
+            regexp: '^IPV6='
+            line: 'IPV6=no'
+      when: disable_ipv6
+
     - name: Allow required ports
       ufw:
         rule: allow
         port: "{{ item }}"
       loop:
         - "22"    # SSH
-        - "3000"  # Grafana
-        - "9090"  # Prometheus
-        - "9093"  # Alertmanager
-        - "3100"  # Loki
-        - "9000"  # Portainer
-        - "3001"  # Uptime Kuma
       notify: enable ufw
 
     - name: Allow node exporter from Docker bridge
@@ -647,7 +683,8 @@ cat > site.yml <<'YAML'
           {
             "log-driver": "json-file",
             "log-opts": { "max-size": "10m", "max-file": "5" },
-            "features": { "buildkit": true }
+            "features": { "buildkit": true },
+            "live-restore": true
           }
       notify: restart docker
 
@@ -700,6 +737,27 @@ cat > site.yml <<'YAML'
                     severity: critical
                   annotations:
                     summary: "Instance {{ $labels.instance }} is down"
+                - alert: HostDiskAlmostFull
+                  expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.10
+                  for: 5m
+                  labels:
+                    severity: warning
+                  annotations:
+                    summary: "Root disk on {{ $labels.instance }} is almost full"
+                - alert: PrometheusDiskSpaceLow
+                  expr: prometheus_tsdb_low_storage_space == 1
+                  for: 5m
+                  labels:
+                    severity: warning
+                  annotations:
+                    summary: "Prometheus TSDB storage is almost full"
+                - alert: GrafanaDown
+                  expr: up{job="grafana"} == 0
+                  for: 2m
+                  labels:
+                    severity: critical
+                  annotations:
+                    summary: "Grafana is down"
 
     - name: Loki config
       copy:
@@ -764,12 +822,61 @@ cat > site.yml <<'YAML'
         path: /srv/ops/config/secrets
         state: directory
         mode: "0700"
+    - name: Generate Grafana admin password if unset
+      command: openssl rand -base64 24
+      register: grafana_pw
+      when: grafana_admin_password in ['', 'changeme']
+
+    - name: Persist generated Grafana password
+      lineinfile:
+        path: /srv/ops/ansible/group_vars/all.yml
+        regexp: '^grafana_admin_password:'
+        line: 'grafana_admin_password: "{{ grafana_pw.stdout }}"'
+      when: grafana_pw is defined
+
+    - name: Set grafana_admin_password fact
+      set_fact:
+        grafana_admin_password: "{{ grafana_pw.stdout }}"
+      when: grafana_pw is defined
+
+    - name: Generate Portainer admin password if unset
+      command: openssl rand -base64 24
+      register: portainer_pw_plain
+      when: portainer_admin_password_hash | length == 0
+
+    - name: Hash Portainer admin password
+      command: "openssl passwd -bcrypt {{ portainer_pw_plain.stdout }}"
+      register: portainer_pw_hash
+      when: portainer_pw_plain is defined
+
+    - name: Persist generated Portainer hash
+      lineinfile:
+        path: /srv/ops/ansible/group_vars/all.yml
+        regexp: '^portainer_admin_password_hash:'
+        line: 'portainer_admin_password_hash: "{{ portainer_pw_hash.stdout }}"'
+      when: portainer_pw_hash is defined
+
+    - name: Set portainer_admin_password_hash fact
+      set_fact:
+        portainer_admin_password_hash: "{{ portainer_pw_hash.stdout }}"
+      when: portainer_pw_hash is defined
 
     - name: Grafana admin password secret
       copy:
         dest: /srv/ops/config/secrets/grafana_admin
         mode: "0600"
         content: "{{ grafana_admin_password }}"
+
+    - name: Portainer admin password hash secret
+      copy:
+        dest: /srv/ops/config/secrets/portainer_admin
+        mode: "0600"
+        content: "{{ portainer_admin_password_hash }}"
+
+    - name: Display Portainer admin password
+      debug:
+        msg: "Portainer admin password: {{ portainer_pw_plain.stdout }}"
+      when: portainer_pw_plain is defined
 
     - name: Compose file for ops stack
       copy:
@@ -788,7 +895,7 @@ cat > site.yml <<'YAML'
                 - prometheus:/prometheus
                 # Bind-mount alternative (pick one, then remove named volume "prometheus" below):
                 # - /srv/ops/data/prometheus:/prometheus
-              ports: ["9090:9090"]
+              ports: ["{{ ops_listen_ip }}:9090:9090"]
               restart: unless-stopped
               healthcheck:
                 test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:9090/-/ready) || (which wget && wget -qO- http://localhost:9090/-/ready)"]
@@ -799,7 +906,7 @@ cat > site.yml <<'YAML'
               image: prom/alertmanager:__ALERTMANAGER_VERSION__
               volumes:
                 - /srv/ops/config/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-              ports: ["9093:9093"]
+              ports: ["{{ ops_listen_ip }}:9093:9093"]
               restart: unless-stopped
               healthcheck:
                 test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:9093/-/ready) || (which wget && wget -qO- http://localhost:9093/-/ready)"]
@@ -816,7 +923,7 @@ cat > site.yml <<'YAML'
               volumes:
                 - grafana:/var/lib/grafana
                 - /srv/ops/config/grafana/provisioning:/etc/grafana/provisioning:ro
-              ports: ["3000:3000"]
+              ports: ["{{ ops_listen_ip }}:3000:3000"]
               restart: unless-stopped
               healthcheck:
                 test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:3000/api/health) || (which wget && wget -qO- http://localhost:3000/api/health)"]
@@ -829,7 +936,7 @@ cat > site.yml <<'YAML'
               volumes:
                 - /srv/ops/config/loki-config.yml:/etc/loki/loki-config.yml:ro
                 - loki:/loki
-              ports: ["3100:3100"]
+              ports: ["{{ ops_listen_ip }}:3100:3100"]
               restart: unless-stopped
               healthcheck:
                 test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:3100/ready) || (which wget && wget -qO- http://localhost:3100/ready)"]
@@ -854,7 +961,10 @@ cat > site.yml <<'YAML'
               volumes:
                 - /var/run/docker.sock:/var/run/docker.sock
                 - portainer:/data
-              ports: ["9000:9000"]
+              ports: ["{{ ops_listen_ip }}:9000:9000"]
+              command: ["--admin-password-file", "/run/secrets/portainer_admin"]
+              secrets:
+                - portainer_admin
               restart: unless-stopped
               healthcheck:
                 test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:9000/api/status) || (which wget && wget -qO- http://localhost:9000/api/status)"]
@@ -879,7 +989,7 @@ cat > site.yml <<'YAML'
               image: louislam/uptime-kuma:__UPTIME_KUMA_VERSION__
               volumes:
                 - uptimekuma:/app/data
-              ports: ["3001:3001"]
+              ports: ["{{ ops_listen_ip }}:3001:3001"]
               restart: unless-stopped
               healthcheck:
                 test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:3001/) || (which wget && wget -qO- http://localhost:3001/)"]
@@ -896,6 +1006,8 @@ cat > site.yml <<'YAML'
           secrets:
             grafana_admin:
               file: /srv/ops/config/secrets/grafana_admin
+            portainer_admin:
+              file: /srv/ops/config/secrets/portainer_admin
 
     - name: Installer: add-trust-ca.sh (trust SSH CA on targets)
       copy:
@@ -903,12 +1015,13 @@ cat > site.yml <<'YAML'
         mode: "0755"
         content: |
           #!/usr/bin/env bash
-          # Usage: add-trust-ca.sh <URL or /path/to/ssh_ca.pub>
+          # Usage: add-trust-ca.sh <URL or /path/to/ssh_ca.pub> [revoked_keys]
           set -euo pipefail
           SRC="${1:-}"
+          REV="${2:-}"
           TMP="$(mktemp)"
           if [[ -z "${SRC}" ]]; then
-            echo "Usage: $0 <URL or /path/to/ssh_ca.pub>" >&2; exit 2
+            echo "Usage: $0 <URL or /path/to/ssh_ca.pub> [revoked_keys]" >&2; exit 2
           fi
           if [[ "${SRC}" =~ ^https?:// ]]; then
             curl -fsSL "${SRC}" -o "${TMP}"
@@ -918,6 +1031,22 @@ cat > site.yml <<'YAML'
           fi
           sudo install -m0644 "${TMP}" /etc/ssh/trusted-user-ca-keys.pem
           rm -f "${TMP}"
+          if [[ -n "${REV}" ]]; then
+            TMP_REV="$(mktemp)"
+            if [[ "${REV}" =~ ^https?:// ]]; then
+              curl -fsSL "${REV}" -o "${TMP_REV}"
+            else
+              [[ -f "${REV}" ]] || { echo "No such file: ${REV}" >&2; exit 2; }
+              cp -f "${REV}" "${TMP_REV}"
+            fi
+            sudo install -m0644 "${TMP_REV}" /etc/ssh/revoked_keys
+            rm -f "${TMP_REV}"
+            if grep -qE '^\s*RevokedKeys\b' /etc/ssh/sshd_config; then
+              sudo sed -i 's#^\s*RevokedKeys.*#RevokedKeys /etc/ssh/revoked_keys#' /etc/ssh/sshd_config
+            else
+              echo 'RevokedKeys /etc/ssh/revoked_keys' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+            fi
+          fi
           if grep -qE '^\s*TrustedUserCAKeys\b' /etc/ssh/sshd_config; then
             sudo sed -i 's#^\s*TrustedUserCAKeys.*#TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem#' /etc/ssh/sshd_config
           else
@@ -1069,17 +1198,14 @@ printf "[+] Images pinned: prom %s, alert %s, grafana %s, loki %s, promtail %s\n
 # ------------------------------------------------------------
 # Exit banner
 # ------------------------------------------------------------
-if grep -q 'grafana_admin_password: "changeme"' /srv/ops/ansible/group_vars/all.yml 2>/dev/null; then
-  say "WARNING: Grafana admin password is still 'changeme'; update /srv/ops/ansible/group_vars/all.yml"
-fi
-
-IP_NOW=$(hostname -I | awk '{print $1}')
+OPS_IP=$(awk -F': ' '/^ops_listen_ip:/ {print $2}' /srv/ops/ansible/group_vars/all.yml | tr -d '"')
+IP_NOW=${OPS_IP:-$(hostname -I | awk '{print $1}')}
 say "Done. If you were added to the docker group, log out/in. URLs:"
 say " Grafana       : http://$IP_NOW:3000 (admin / see group_vars/all.yml: grafana_admin_password)"
 say " Prometheus    : http://$IP_NOW:9090"
 say " Alertmanager  : http://$IP_NOW:9093"
 say " Loki (API)    : http://$IP_NOW:3100"
-say " Portainer     : http://$IP_NOW:9000"
+say " Portainer     : http://$IP_NOW:9000 (admin / password printed during install)"
 say " Registry      : http://localhost:5000 (use docker login)"
 say " Uptime Kuma   : http://$IP_NOW:3001"
 say " Log file      : $LOG_FILE"
