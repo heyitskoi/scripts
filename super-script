@@ -66,26 +66,47 @@ $SUDO usermod -aG docker "$ME" || true
 # ------------------------------------------------------------
 # Helpers to install single-file archives
 # ------------------------------------------------------------
-install_zip_bin(){ # name ver url
-  local name="$1" ver="$2" url="$3"
+install_zip_bin(){ # name ver url sha256
+  local name="$1" ver="$2" url="$3" sha="$4"
   command -v "$name" >/dev/null 2>&1 && return 0
   say "Installing $name $ver…"
-  curl -fsSL -o "/tmp/${name}.zip" "$url"
-  $SUDO unzip -o "/tmp/${name}.zip" -d /usr/local/bin/
+  local tmp
+  tmp=$(mktemp "/tmp/${name}.XXXXXX.zip")
+  curl -fsSL -o "$tmp" "$url"
+  local sum
+  sum=$(sha256sum "$tmp" | awk '{print $1}')
+  if [ "$sum" != "$sha" ]; then
+    rm -f "$tmp"
+    nope "$name checksum mismatch"
+  fi
+  $SUDO unzip -o "$tmp" -d /usr/local/bin/
   $SUDO chmod +x "/usr/local/bin/${name}"
+  rm -f "$tmp"
 }
 
-install_tgz_bin(){ # name url
-  local name="$1" url="$2"
+install_tgz_bin(){ # name url sha256
+  local name="$1" url="$2" sha="$3"
   command -v "$name" >/dev/null 2>&1 && return 0
   say "Installing $name…"
-  curl -fsSL -o "/tmp/${name}.tgz" "$url"
-  mkdir -p "/tmp/${name}-xz"
-  tar -xzf "/tmp/${name}.tgz" -C "/tmp/${name}-xz"
-  local bin
-  bin=$(find "/tmp/${name}-xz" -type f -name "$name" | head -n1 || true)
-  [ -n "$bin" ] || { nope "Failed to locate $name in archive"; }
+  local tmp tmpdir sum bin
+  tmp=$(mktemp "/tmp/${name}.XXXXXX.tgz")
+  curl -fsSL -o "$tmp" "$url"
+  sum=$(sha256sum "$tmp" | awk '{print $1}')
+  if [ "$sum" != "$sha" ]; then
+    rm -f "$tmp"
+    nope "$name checksum mismatch"
+  fi
+  tmpdir=$(mktemp -d "/tmp/${name}-XXXXXX")
+  tar -xzf "$tmp" -C "$tmpdir"
+  bin=$(find "$tmpdir" -type f -name "$name" | head -n1 || true)
+  if [ -z "$bin" ]; then
+    rm -f "$tmp"
+    rm -rf "$tmpdir"
+    nope "Failed to locate $name in archive"
+  fi
   $SUDO install -m0755 "$bin" "/usr/local/bin/${name}"
+  rm -f "$tmp"
+  rm -rf "$tmpdir"
 }
 
 # Arch detect
@@ -97,11 +118,22 @@ case "$ARCH" in
   *) say "Unknown arch $ARCH; URLs may need adjusting." ;;
 esac
 
-install_zip_bin terraform "1.9.5" "https://releases.hashicorp.com/terraform/1.9.5/terraform_1.9.5_linux_${ARCH}.zip"
-install_zip_bin packer    "1.11.2" "https://releases.hashicorp.com/packer/1.11.2/packer_1.11.2_linux_${ARCH}.zip"
+tf_ver="1.9.5"
+tf_url="https://releases.hashicorp.com/terraform/${tf_ver}/terraform_${tf_ver}_linux_${ARCH}.zip"
+tf_sha=$(curl -fsSL "https://releases.hashicorp.com/terraform/${tf_ver}/terraform_${tf_ver}_SHA256SUMS" | grep "terraform_${tf_ver}_linux_${ARCH}.zip" | awk '{print $1}')
+install_zip_bin terraform "$tf_ver" "$tf_url" "$tf_sha"
+
+packer_ver="1.11.2"
+packer_url="https://releases.hashicorp.com/packer/${packer_ver}/packer_${packer_ver}_linux_${ARCH}.zip"
+packer_sha=$(curl -fsSL "https://releases.hashicorp.com/packer/${packer_ver}/packer_${packer_ver}_SHA256SUMS" | grep "packer_${packer_ver}_linux_${ARCH}.zip" | awk '{print $1}')
+install_zip_bin packer "$packer_ver" "$packer_url" "$packer_sha"
+
 # Trivy prebuilt is x86_64-only in this URL; skip gracefully on others
 if [ "$ARCH" = "amd64" ]; then
-  install_tgz_bin trivy "https://github.com/aquasecurity/trivy/releases/download/v0.54.1/trivy_0.54.1_Linux-64bit.tar.gz" || true
+  trivy_ver="0.54.1"
+  trivy_url="https://github.com/aquasecurity/trivy/releases/download/v${trivy_ver}/trivy_${trivy_ver}_Linux-64bit.tar.gz"
+  trivy_sha=$(curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${trivy_ver}/trivy_${trivy_ver}_checksums.txt" | grep "trivy_${trivy_ver}_Linux-64bit.tar.gz" | awk '{print $1}')
+  install_tgz_bin trivy "$trivy_url" "$trivy_sha" || true
 else
   say "Skipping trivy prebuilt for ARCH=$ARCH; install manually later."
 fi
