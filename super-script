@@ -251,11 +251,13 @@ grafana_admin_password: "changeme"  # change post-install or set here
 
 # Multinode-curious knobs (safe defaults for single host)
 prom_host: "localhost"
-loki_host: "localhost"
 grafana_host: "localhost"
 
 prometheus_url: "http://{{ prom_host }}:9090"
-loki_url:       "http://{{ loki_host }}:3100"
+
+# Loki endpoints
+loki_url_container: "http://loki:3100"        # for Docker services talking to Loki
+loki_url_agents: "http://{{ ansible_default_ipv4.address }}:3100"  # for remote hosts
 
 # Prometheus targets (expand as you onboard servers)
 prom_targets: []  # Add more targets like "10.0.0.12:9100", "web-1:9100" etc. The local host is auto-added.
@@ -304,7 +306,7 @@ cat > templates/promtail-config.yml.j2 <<'J2'
 server:
   http_listen_port: 9080
 clients:
-  - url: "{{ loki_url }}/loki/api/v1/push"
+  - url: "{{ loki_url_container }}/loki/api/v1/push"
 positions:
   filename: /var/lib/promtail/positions.yaml
 scrape_configs:
@@ -336,7 +338,7 @@ fi
 sudo mkdir -p /etc/promtail /var/lib/promtail
 cat <<CFG | sudo tee /etc/promtail/config.yml >/dev/null
 server: { http_listen_port: 9080 }
-clients: [ { url: "http://{{ ansible_default_ipv4.address }}:3100/loki/api/v1/push" } ]
+clients: [ { url: "{{ loki_url_agents }}/loki/api/v1/push" } ]
 positions: { filename: /var/lib/promtail/positions.yaml }
 scrape_configs:
   - job_name: varlogs
@@ -688,6 +690,7 @@ cat > site.yml <<'YAML'
             grafana:
               image: grafana/grafana:__GRAFANA_VERSION__
               environment:
+                - GF_SECURITY_ADMIN_USER=admin
                 - GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password }}
               volumes:
                 - grafana:/var/lib/grafana
@@ -723,7 +726,7 @@ cat > site.yml <<'YAML'
                 REGISTRY_STORAGE_DELETE_ENABLED: "true"
               volumes:
                 - registry:/var/lib/registry
-              ports: ["127.0.0.1:5000:5000"]
+              ports: ["127.0.0.1:5000:5000"]  # bound to loopback; do not expose
               restart: unless-stopped
             uptime-kuma:
               image: louislam/uptime-kuma:__UPTIME_KUMA_VERSION__
@@ -892,6 +895,13 @@ if [ -z "${DRY_RUN:-}" ]; then
     nope "Service checks failed. Use 'docker compose -f /srv/ops/compose/ops.yml ps' and inspect logs."
   fi
 fi
+
+# Quick stack info
+docker --version | tee -a "$LOG_FILE"
+ansible --version | head -n1 | tee -a "$LOG_FILE"
+printf "[+] Images pinned: prom %s, alert %s, grafana %s, loki %s, promtail %s\n" \
+  "$PROMETHEUS_VERSION" "$ALERTMANAGER_VERSION" "$GRAFANA_VERSION" "$LOKI_VERSION" "$PROMTAIL_VERSION" \
+  | ${SUDO:-} tee -a "$LOG_FILE" >/dev/null
 
 # ------------------------------------------------------------
 # Exit banner
