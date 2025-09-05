@@ -25,7 +25,14 @@ nope(){
 
 trap 'nope "Failed at line $LINENO. See $LOG_FILE for details."' ERR
 
-exec 9>/var/lock/supersetup.lock
+LOCK_FILE=${LOCK_FILE:-/var/lock/supersetup.lock}
+if [ -n "$SUDO" ]; then
+  $SUDO install -m 0644 /dev/null "$LOCK_FILE" 2>/dev/null || {
+    LOCK_FILE=/run/lock/supersetup.lock
+    $SUDO install -m 0644 /dev/null "$LOCK_FILE" 2>/dev/null || true
+  }
+fi
+exec 9>>"$LOCK_FILE" || nope "Cannot open lock file $LOCK_FILE"
 flock -n 9 || nope "Another run is in progress."
 
 # ------------------------------------------------------------
@@ -81,6 +88,11 @@ apt_retry(){ # args: apt-get subcommand + options
   done
   [ $n -lt 3 ] || nope "apt-get failed after retries: $*"
 }
+
+if [ "${MODE:-run}" = "dry-run" ]; then
+  say "DRY RUN: validating environment only (no installs/scaffold)."
+  exit 0
+fi
 
 # ------------------------------------------------------------
 # Base packages
@@ -165,7 +177,7 @@ install_zip_bin_gpg(){ # name ver url sig_url keyring
   tmp_sig="$tmp.sig"
   curl -fsSL -o "$tmp" "$url"
   curl -fsSL -o "$tmp_sig" "$sig_url"
-  if ! gpg --keyring "$keyring" --verify "$tmp_sig" "$tmp" >/dev/null 2>&1; then
+  if ! gpg --no-default-keyring --keyring "$keyring" --verify "$tmp_sig" "$tmp" >/dev/null 2>&1; then
     rm -f "$tmp" "$tmp_sig"
     nope "$name signature verification failed"
   fi
@@ -439,6 +451,10 @@ cat > site.yml <<'YAML'
       setup:
     - name: Collect service facts
       service_facts:
+    - name: Ensure persistent systemd-journald storage
+      file: { path: /var/log/journal, state: directory, mode: "0755" }
+    - name: Restart systemd-journald to use persistent storage
+      service: { name: systemd-journald, state: restarted }
 
   tasks:
     - name: Create ops directories
@@ -526,6 +542,9 @@ cat > site.yml <<'YAML'
         - "9000"  # Portainer
         - "3001"  # Uptime Kuma
       notify: enable ufw
+
+    - name: Allow node exporter from Docker bridge
+      ufw: { rule: allow, port: "9100", src: "172.17.0.0/16" }
 
     - name: Allow WireGuard port
       ufw:
@@ -740,7 +759,7 @@ cat > site.yml <<'YAML'
               ports: ["9090:9090"]
               restart: unless-stopped
               healthcheck:
-                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9090/-/ready"]
+                test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:9090/-/ready) || (which wget && wget -qO- http://localhost:9090/-/ready)"]
                 interval: 10s
                 timeout: 3s
                 retries: 10
@@ -751,7 +770,7 @@ cat > site.yml <<'YAML'
               ports: ["9093:9093"]
               restart: unless-stopped
               healthcheck:
-                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9093/-/ready"]
+                test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:9093/-/ready) || (which wget && wget -qO- http://localhost:9093/-/ready)"]
                 interval: 10s
                 timeout: 3s
                 retries: 10
@@ -768,7 +787,7 @@ cat > site.yml <<'YAML'
               ports: ["3000:3000"]
               restart: unless-stopped
               healthcheck:
-                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3000/api/health"]
+                test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:3000/api/health) || (which wget && wget -qO- http://localhost:3000/api/health)"]
                 interval: 10s
                 timeout: 3s
                 retries: 10
@@ -781,7 +800,7 @@ cat > site.yml <<'YAML'
               ports: ["3100:3100"]
               restart: unless-stopped
               healthcheck:
-                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3100/ready"]
+                test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:3100/ready) || (which wget && wget -qO- http://localhost:3100/ready)"]
                 interval: 10s
                 timeout: 3s
                 retries: 10
@@ -794,7 +813,7 @@ cat > site.yml <<'YAML'
                 - /var/lib/promtail:/var/lib/promtail
               restart: unless-stopped
               healthcheck:
-                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9080/ready"]
+                test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:9080/ready) || (which wget && wget -qO- http://localhost:9080/ready)"]
                 interval: 10s
                 timeout: 3s
                 retries: 10
@@ -806,7 +825,7 @@ cat > site.yml <<'YAML'
               ports: ["9000:9000"]
               restart: unless-stopped
               healthcheck:
-                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9000/api/status"]
+                test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:9000/api/status) || (which wget && wget -qO- http://localhost:9000/api/status)"]
                 interval: 10s
                 timeout: 3s
                 retries: 10
@@ -820,7 +839,7 @@ cat > site.yml <<'YAML'
               ports: ["127.0.0.1:5000:5000"]  # bound to loopback; do not expose
               restart: unless-stopped
               healthcheck:
-                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:5000/v2/"]
+                test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:5000/v2/) || (which wget && wget -qO- http://localhost:5000/v2/)"]
                 interval: 10s
                 timeout: 3s
                 retries: 10
@@ -831,7 +850,7 @@ cat > site.yml <<'YAML'
               ports: ["3001:3001"]
               restart: unless-stopped
               healthcheck:
-                test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3001/"]
+                test: ["CMD-SHELL", "(which curl && curl -fsS http://localhost:3001/) || (which wget && wget -qO- http://localhost:3001/)"]
                 interval: 10s
                 timeout: 3s
                 retries: 10
