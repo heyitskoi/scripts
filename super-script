@@ -604,6 +604,39 @@ say "Running Ansible (local)…"
 ansible-playbook -i inventory.ini site.yml
 
 # ------------------------------------------------------------
+# Service health checks
+# ------------------------------------------------------------
+say "Checking services…"
+fail=0
+cd /srv/ops/compose
+docker compose -f ops.yml ps || fail=1
+
+probe(){ # name url
+  local name="$1" url="$2" retries=3 i
+  for i in $(seq "$retries"); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      say "$name responding at $url"
+      return 0
+    fi
+    sleep 3
+  done
+  say "$name FAILED at $url"
+  fail=1
+}
+
+probe "Grafana"      "http://localhost:3000/login"
+probe "Prometheus"   "http://localhost:9090/-/ready"
+probe "Alertmanager" "http://localhost:9093/-/ready"
+probe "Loki"         "http://localhost:3100/ready"
+probe "Portainer"    "http://localhost:9000"
+probe "Registry"     "http://localhost:5000/v2/"
+probe "Uptime Kuma"  "http://localhost:3001"
+
+if [ "$fail" -ne 0 ]; then
+  nope "Service checks failed. Use 'docker compose -f /srv/ops/compose/ops.yml ps' and inspect logs."
+fi
+
+# ------------------------------------------------------------
 # Exit banner
 # ------------------------------------------------------------
 IP_NOW=$(hostname -I | awk '{print $1}')
