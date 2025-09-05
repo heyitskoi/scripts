@@ -7,9 +7,11 @@
 # ============================================================================
 
 set -euo pipefail
-trap 'nope "Failed at line $LINENO. See $LOG_FILE for details."' ERR
 IFS=$'\n\t'
+[ "$(id -u)" -eq 0 ] && SUDO="" || SUDO="sudo"
 LOG_FILE=/var/log/supersetup.log # standard location for easy rotation
+$SUDO touch "$LOG_FILE" && $SUDO chmod 0644 "$LOG_FILE" && $SUDO chown root:root "$LOG_FILE"
+ME="${OPS_OWNER:-${SUDO_USER:-${LOGNAME:-$USER}}}"
 
 say(){
   printf "\033[1;32m[+]\033[0m %s\n" "$*"
@@ -20,6 +22,11 @@ nope(){
   printf "[!] %s\n" "$*" | ${SUDO:-} tee -a "$LOG_FILE" >/dev/null
   exit 1
 }
+
+trap 'nope "Failed at line $LINENO. See $LOG_FILE for details."' ERR
+
+exec 9>/var/lock/supersetup.lock
+flock -n 9 || nope "Another run is in progress."
 
 # ------------------------------------------------------------
 # Version variables (override via environment or versions file)
@@ -56,15 +63,10 @@ esac
 # ------------------------------------------------------------
 # Sanity checks
 # ------------------------------------------------------------
-[ "$(id -u)" -eq 0 ] && SUDO="" || SUDO="sudo"
-ME="${OPS_OWNER:-${SUDO_USER:-${LOGNAME:-$USER}}}"
 say "Ops owner user: ${ME}"
 if [ -n "$SUDO" ] && ! sudo -n true 2>/dev/null; then
   nope "Passwordless sudo required for non-root runs. Configure NOPASSWD or run the script with sudo."
 fi
-$SUDO touch "$LOG_FILE"
-$SUDO chown root:root "$LOG_FILE"
-$SUDO chmod 0644 "$LOG_FILE"
 . /etc/os-release || nope "Unknown OS."
 if [[ ! "${ID}" =~ (ubuntu|debian) ]] && [[ ! "${ID_LIKE:-}" =~ (ubuntu|debian) ]]; then
   nope "Use Ubuntu/Debian for this bootstrap."
@@ -84,7 +86,7 @@ apt_retry(){ # args: apt-get subcommand + options
 # Base packages
 # ------------------------------------------------------------
 say "Updating packages…"
-apt_retry update -y
+apt_retry update
 apt_retry install -y --no-install-recommends \
   ca-certificates gnupg lsb-release curl git unzip tar make jq \
   ufw fail2ban python3 python3-pip nmap
@@ -113,20 +115,24 @@ install_docker(){
     echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${codename} stable" | \
       $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
   fi
-  apt_retry update -y
+  apt_retry update
   apt_retry install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   $SUDO systemctl enable --now docker
 }
 install_docker
 
-$SUDO usermod -aG docker "$ME" || true
+if [ "$ME" != "root" ]; then
+  $SUDO usermod -aG docker "$ME" || true
+fi
 
 # ------------------------------------------------------------
 # Helpers to install single-file archives
 # ------------------------------------------------------------
 install_zip_bin(){ # name ver url sha256
   local name="$1" ver="$2" url="$3" sha="$4"
-  command -v "$name" >/dev/null 2>&1 && return 0
+  if command -v "$name" >/dev/null 2>&1 && "$name" version 2>/dev/null | grep -q "$ver"; then
+    return 0
+  fi
   say "Installing $name $ver…"
   local tmp
   tmp=$(mktemp "/tmp/${name}.XXXXXX.zip")
@@ -139,13 +145,17 @@ install_zip_bin(){ # name ver url sha256
   fi
   $SUDO unzip -o "$tmp" -d /usr/local/bin/
   $SUDO chmod +x "/usr/local/bin/${name}"
+  $SUDO mv "/usr/local/bin/${name}" "/usr/local/bin/${name}-${ver}"
+  $SUDO ln -sfn "/usr/local/bin/${name}-${ver}" "/usr/local/bin/${name}"
   rm -f "$tmp"
 }
 
-install_tgz_bin(){ # name url sha256
-  local name="$1" url="$2" sha="$3"
-  command -v "$name" >/dev/null 2>&1 && return 0
-  say "Installing $name…"
+install_tgz_bin(){ # name ver url sha256
+  local name="$1" ver="$2" url="$3" sha="$4"
+  if command -v "$name" >/dev/null 2>&1 && "$name" version 2>/dev/null | grep -q "$ver"; then
+    return 0
+  fi
+  say "Installing $name $ver…"
   local tmp tmpdir sum bin
   tmp=$(mktemp "/tmp/${name}.XXXXXX.tgz")
   curl -fsSL -o "$tmp" "$url"
@@ -162,7 +172,8 @@ install_tgz_bin(){ # name url sha256
     rm -rf "$tmpdir"
     nope "Failed to locate $name in archive"
   fi
-  $SUDO install -m0755 "$bin" "/usr/local/bin/${name}"
+  $SUDO install -m0755 "$bin" "/usr/local/bin/${name}-${ver}"
+  $SUDO ln -sfn "/usr/local/bin/${name}-${ver}" "/usr/local/bin/${name}"
   rm -f "$tmp"
   rm -rf "$tmpdir"
 }
@@ -193,12 +204,12 @@ if [ "$ARCH" = "amd64" ]; then
   trivy_url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
   trivy_sha="$(curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt" \
     | grep "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" | awk '{print $1}')"
-  install_tgz_bin trivy "$trivy_url" "$trivy_sha" || true
+  install_tgz_bin trivy "$TRIVY_VERSION" "$trivy_url" "$trivy_sha" || true
 elif [ "$ARCH" = "arm64" ]; then
   trivy_url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz"
   trivy_sha="$(curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt" \
     | grep "trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz" | awk '{print $1}')"
-  install_tgz_bin trivy "$trivy_url" "$trivy_sha" || true
+  install_tgz_bin trivy "$TRIVY_VERSION" "$trivy_url" "$trivy_sha" || true
 else
   say "Skipping trivy prebuilt for ARCH=$ARCH; install manually later."
 fi
@@ -331,7 +342,7 @@ if command -v apt-get >/dev/null; then
     done
     [ $n -lt 3 ]
   }
-  apt_retry update -y
+  apt_retry update
   apt_retry install -y prometheus-node-exporter
   sudo systemctl enable --now prometheus-node-exporter
 fi
