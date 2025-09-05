@@ -30,9 +30,9 @@ trap 'nope "Failed at line $LINENO. See $LOG_FILE for details."' ERR
 
 LOCK_FILE=${LOCK_FILE:-/var/lock/supersetup.lock}
 if [ -n "$SUDO" ]; then
-  $SUDO install -m 0600 /dev/null "$LOCK_FILE" 2>/dev/null || {
+  $SUDO install -o "$ME" -g "$ME" -m 0644 /dev/null "$LOCK_FILE" 2>/dev/null || {
     LOCK_FILE=/run/lock/supersetup.lock
-    $SUDO install -m 0600 /dev/null "$LOCK_FILE" 2>/dev/null || true
+    $SUDO install -o "$ME" -g "$ME" -m 0644 /dev/null "$LOCK_FILE" 2>/dev/null || true
   }
 fi
 exec 9>>"$LOCK_FILE" || nope "Cannot open lock file $LOCK_FILE"
@@ -203,6 +203,9 @@ install_tgz_bin(){ # name ver url sha256
 import_hashicorp_release_key() {
   gpg --list-keys "HashiCorp" >/dev/null 2>&1 && return 0
   curl -fsSL https://keybase.io/hashicorp/pgp_keys.asc | gpg --import -
+  expected="91A6E7F85D05C65630BEF18951852D87348FFC4C"  # update if rotated
+  gpg --fingerprint --with-colons "HashiCorp" | grep -q "$expected" \
+    || nope "HashiCorp PGP fingerprint mismatch"
 }
 
 verify_hashicorp_sums() { # name ver
@@ -529,6 +532,7 @@ cat > site.yml <<'YAML'
         - /srv/ops/compose
         - /srv/ops/config
         - /srv/ops/installers
+        - /srv/ops/.docker
         - /srv/ops/data/prometheus
         - /srv/ops/data/grafana
         - /srv/ops/data/loki
@@ -650,8 +654,8 @@ cat > site.yml <<'YAML'
       when: ops_listen_ip not in ['127.0.0.1','::1']
       notify: enable ufw
 
-    - name: Allow node exporter from Docker bridge
-      ufw: { rule: allow, port: "9100", src: "172.17.0.0/16" }
+    - name: Allow node exporter from Docker networks
+      ufw: { rule: allow, port: "9100", src: "172.16.0.0/12" }
 
     - name: Allow WireGuard port
       ufw:
@@ -1112,8 +1116,10 @@ cat > site.yml <<'YAML'
           ExecStart=/usr/bin/docker compose -f /srv/ops/compose/ops.yml up -d --wait
           ExecStop=/usr/bin/docker compose -f /srv/ops/compose/ops.yml down
           TimeoutStartSec=0
+          Environment=DOCKER_CONFIG=/srv/ops/.docker
+          ReadWritePaths=/srv/ops/.docker
           ProtectSystem=full
-          ProtectHome=true
+          ProtectHome=read-only
           PrivateTmp=true
           [Install]
           WantedBy=multi-user.target
@@ -1194,7 +1200,8 @@ fi
 if [ -z "${DRY_RUN:-}" ]; then
   say "Checking services…"
   fail=0
-  cd /srv/ops/compose
+  [ -d /srv/ops/compose ] || nope "No stack at /srv/ops/compose. Run 'run' first."
+  cd /srv/ops/compose || nope "Cannot cd to compose dir"
   docker compose -f ops.yml ps || fail=1
 
   probe(){ # name url
