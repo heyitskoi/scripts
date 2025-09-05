@@ -13,6 +13,26 @@ say(){ printf "\033[1;32m[+]\033[0m %s\n" "$*"; }
 nope(){ printf "\033[1;31m[!]\033[0m %s\n" "$*" >&2; exit 1; }
 
 # ------------------------------------------------------------
+# Version variables (override via environment or versions file)
+# ------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION_FILE="${VERSION_FILE:-$SCRIPT_DIR/versions.env}"
+# shellcheck source=/dev/null
+[ -f "$VERSION_FILE" ] && . "$VERSION_FILE"
+
+: "${TERRAFORM_VERSION:?TERRAFORM_VERSION not set}"
+: "${PACKER_VERSION:?PACKER_VERSION not set}"
+: "${TRIVY_VERSION:?TRIVY_VERSION not set}"
+: "${PROMETHEUS_VERSION:?PROMETHEUS_VERSION not set}"
+: "${ALERTMANAGER_VERSION:?ALERTMANAGER_VERSION not set}"
+: "${GRAFANA_VERSION:?GRAFANA_VERSION not set}"
+: "${LOKI_VERSION:?LOKI_VERSION not set}"
+: "${PROMTAIL_VERSION:?PROMTAIL_VERSION not set}"
+: "${PORTAINER_VERSION:?PORTAINER_VERSION not set}"
+: "${REGISTRY_VERSION:?REGISTRY_VERSION not set}"
+: "${UPTIME_KUMA_VERSION:?UPTIME_KUMA_VERSION not set}"
+
+# ------------------------------------------------------------
 # Sanity checks
 # ------------------------------------------------------------
 [ "$(id -u)" -eq 0 ] && SUDO="" || SUDO="sudo"
@@ -97,11 +117,11 @@ case "$ARCH" in
   *) say "Unknown arch $ARCH; URLs may need adjusting." ;;
 esac
 
-install_zip_bin terraform "1.9.5" "https://releases.hashicorp.com/terraform/1.9.5/terraform_1.9.5_linux_${ARCH}.zip"
-install_zip_bin packer    "1.11.2" "https://releases.hashicorp.com/packer/1.11.2/packer_1.11.2_linux_${ARCH}.zip"
+install_zip_bin terraform "$TERRAFORM_VERSION" "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip"
+install_zip_bin packer    "$PACKER_VERSION" "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_${ARCH}.zip"
 # Trivy prebuilt is x86_64-only in this URL; skip gracefully on others
 if [ "$ARCH" = "amd64" ]; then
-  install_tgz_bin trivy "https://github.com/aquasecurity/trivy/releases/download/v0.54.1/trivy_0.54.1_Linux-64bit.tar.gz" || true
+  install_tgz_bin trivy "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" || true
 else
   say "Skipping trivy prebuilt for ARCH=$ARCH; install manually later."
 fi
@@ -227,8 +247,9 @@ sudo docker run -d --name promtail --restart unless-stopped \
   -v /var/log:/var/log:ro \
   -v /var/lib/promtail:/var/lib/promtail \
   -p 9080:9080 \
-  grafana/promtail:2.9.8 -config.file=/etc/promtail/config.yml
+  grafana/promtail:__PROMTAIL_VERSION__ -config.file=/etc/promtail/config.yml
 J2
+sed -i "s/__PROMTAIL_VERSION__/${PROMTAIL_VERSION}/g" templates/install-agents.sh.j2
 
 # -------- site playbook --------
 cat > site.yml <<'YAML'
@@ -449,7 +470,7 @@ cat > site.yml <<'YAML'
         content: |
           services:
             prometheus:
-              image: prom/prometheus:v2.55.0
+              image: prom/prometheus:__PROMETHEUS_VERSION__
               command: ["--config.file=/etc/prometheus/prometheus.yml","--web.enable-lifecycle","--web.route-prefix=/"]
               volumes:
                 - /srv/ops/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -460,13 +481,13 @@ cat > site.yml <<'YAML'
               ports: ["9090:9090"]
               restart: unless-stopped
             alertmanager:
-              image: prom/alertmanager:v0.27.0
+              image: prom/alertmanager:__ALERTMANAGER_VERSION__
               volumes:
                 - /srv/ops/config/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
               ports: ["9093:9093"]
               restart: unless-stopped
             grafana:
-              image: grafana/grafana:10.4.6
+              image: grafana/grafana:__GRAFANA_VERSION__
               environment:
                 - GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password }}
               volumes:
@@ -475,7 +496,7 @@ cat > site.yml <<'YAML'
               ports: ["3000:3000"]
               restart: unless-stopped
             loki:
-              image: grafana/loki:2.9.8
+              image: grafana/loki:__LOKI_VERSION__
               command: ["-config.file=/etc/loki/loki-config.yml"]
               volumes:
                 - /srv/ops/config/loki-config.yml:/etc/loki/loki-config.yml:ro
@@ -483,7 +504,7 @@ cat > site.yml <<'YAML'
               ports: ["3100:3100"]
               restart: unless-stopped
             promtail:
-              image: grafana/promtail:2.9.8
+              image: grafana/promtail:__PROMTAIL_VERSION__
               command: ["-config.file=/etc/promtail/config.yml"]
               volumes:
                 - /srv/ops/config/promtail-config.yml:/etc/promtail/config.yml:ro
@@ -491,14 +512,14 @@ cat > site.yml <<'YAML'
                 - /var/lib/promtail:/var/lib/promtail
               restart: unless-stopped
             portainer:
-              image: portainer/portainer-ce:2.21.4
+              image: portainer/portainer-ce:__PORTAINER_VERSION__
               volumes:
                 - /var/run/docker.sock:/var/run/docker.sock
                 - portainer:/data
               ports: ["9000:9000"]
               restart: unless-stopped
             registry:
-              image: registry:2
+              image: registry:__REGISTRY_VERSION__
               environment:
                 REGISTRY_STORAGE_DELETE_ENABLED: "true"
               volumes:
@@ -506,7 +527,7 @@ cat > site.yml <<'YAML'
               ports: ["5000:5000"]
               restart: unless-stopped
             uptime-kuma:
-              image: louislam/uptime-kuma:1
+              image: louislam/uptime-kuma:__UPTIME_KUMA_VERSION__
               volumes:
                 - uptimekuma:/app/data
               ports: ["3001:3001"]
@@ -596,6 +617,16 @@ cat > site.yml <<'YAML'
     - name: restart docker
       service: { name: docker, state: restarted }
 YAML
+sed -i \
+  -e "s/__PROMETHEUS_VERSION__/${PROMETHEUS_VERSION}/g" \
+  -e "s/__ALERTMANAGER_VERSION__/${ALERTMANAGER_VERSION}/g" \
+  -e "s/__GRAFANA_VERSION__/${GRAFANA_VERSION}/g" \
+  -e "s/__LOKI_VERSION__/${LOKI_VERSION}/g" \
+  -e "s/__PROMTAIL_VERSION__/${PROMTAIL_VERSION}/g" \
+  -e "s/__PORTAINER_VERSION__/${PORTAINER_VERSION}/g" \
+  -e "s/__REGISTRY_VERSION__/${REGISTRY_VERSION}/g" \
+  -e "s/__UPTIME_KUMA_VERSION__/${UPTIME_KUMA_VERSION}/g" \
+  site.yml
 
 # ------------------------------------------------------------
 # Run the playbook
